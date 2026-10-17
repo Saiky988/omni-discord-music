@@ -27,6 +27,8 @@ export const defer = true;
 
 /**
  * Shared execution handler for /play and !play.
+ * Starts playback of the first track immediately and loads any remaining
+ * playlist tracks in the background so the user gets instant audio and feedback.
  *
  * @param {object} context Normalized command execution context
  */
@@ -41,7 +43,8 @@ export async function execute(context) {
     args,
     options,
     resolver,
-    queueManager
+    queueManager,
+    logger
   } = context;
 
   const rawQuery = options?.getString
@@ -70,7 +73,8 @@ export async function execute(context) {
   }
 
   const resolved = await resolver.resolve(rawQuery, {
-    requestedBy: requesterTag
+    requestedBy: requesterTag,
+    eagerFirstTrackOnly: true
   });
 
   if (resolved.kind === 'playlist') {
@@ -80,6 +84,25 @@ export async function execute(context) {
       textChannel,
       adapterCreator
     });
+
+    // If the playlist has deferred tracks to resolve in the background, start them without blocking the reply
+    if (typeof resolved.backgroundTasks === 'function') {
+      void resolved
+        .backgroundTasks(async (resolvedTrack) => {
+          const currentQueue = queueManager.getQueue(guildId);
+          if (!currentQueue || currentQueue.state === 'destroyed') {
+            return false;
+          }
+          await queueManager.enqueue(guildId, resolvedTrack);
+          return true;
+        })
+        .catch((err) => {
+          logger?.warn?.('Background playlist track resolution error', {
+            guildId,
+            error: err.message
+          });
+        });
+    }
 
     return {
       embeds: [buildPlaylistAddedEmbed(resolved, queueResult, queueResult.snapshot)],

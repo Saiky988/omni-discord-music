@@ -100,9 +100,27 @@ export function buildYtdlpArgs(validatedTarget) {
  * clean floating-point gain boost, and brickwall anti-clipping limiter.
  * Produces signed 16-bit little-endian PCM, 48 kHz, stereo.
  *
+ * @param {string | null} [directInputUrl=null] If provided, FFmpeg streams directly from HTTP/HTTPS URL
  * @returns {string[]}
  */
-export function buildFfmpegArgs() {
+export function buildFfmpegArgs(directInputUrl = null) {
+  if (directInputUrl) {
+    return [
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', directInputUrl,
+      '-analyzeduration', '0',
+      '-probesize', '32768',
+      '-loglevel', '0',
+      '-af', HIGH_QUALITY_AUDIO_FILTER,
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1'
+    ];
+  }
+
   return [
     '-i', 'pipe:0',
     '-analyzeduration', '0',
@@ -197,10 +215,11 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
   const ytdlpPath = options.ytdlpPath || config.YTDLP_PATH || 'yt-dlp';
   const ffmpegPath = options.ffmpegPath || config.FFMPEG_PATH || 'ffmpeg';
   const killTimeoutMs = options.killTimeoutMs ?? config.PROCESS_KILL_TIMEOUT_MS ?? 2000;
+  const directFfmpeg = Boolean(options.directFfmpeg);
   const log = (options.logger || defaultLogger).child?.('streamer') || defaultLogger;
 
-  const ytdlpArgs = buildYtdlpArgs(validatedTarget);
-  const ffmpegArgs = buildFfmpegArgs();
+  const ytdlpArgs = directFfmpeg ? [] : buildYtdlpArgs(validatedTarget);
+  const ffmpegArgs = buildFfmpegArgs(directFfmpeg ? validatedTarget : null);
 
   const events = new EventEmitter();
   const ytdlpStderr = { chunks: [], bytes: 0 };
@@ -215,9 +234,9 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
   let failureError = null;
   let ytdlpBytes = 0;
   let pcmBytes = 0;
-  let ytdlpExited = false;
+  let ytdlpExited = directFfmpeg;
   let ffmpegExited = false;
-  let ytdlpExitCode = null;
+  let ytdlpExitCode = directFfmpeg ? 0 : null;
   let ffmpegExitCode = null;
   let cleanupPromise = null;
 
@@ -358,25 +377,27 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     return cleanupPromise;
   }
 
-  try {
-    ytdlpProcess = spawnFn(ytdlpPath, ytdlpArgs, {
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true
-    });
-  } catch (err) {
-    throw new StreamExtractionError(`Failed to spawn yt-dlp (${ytdlpPath}): ${err.message}`, {
-      code: err.code === 'ENOENT' ? ErrorCodes.EXECUTABLE_MISSING : ErrorCodes.EXTRACTION_FAILED,
-      userMessage: 'Could not start the yt-dlp audio extractor process.',
-      context: { sessionId, executable: 'yt-dlp', errorCode: err.code },
-      cause: err
-    });
+  if (!directFfmpeg) {
+    try {
+      ytdlpProcess = spawnFn(ytdlpPath, ytdlpArgs, {
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+      });
+    } catch (err) {
+      throw new StreamExtractionError(`Failed to spawn yt-dlp (${ytdlpPath}): ${err.message}`, {
+        code: err.code === 'ENOENT' ? ErrorCodes.EXECUTABLE_MISSING : ErrorCodes.EXTRACTION_FAILED,
+        userMessage: 'Could not start the yt-dlp audio extractor process.',
+        context: { sessionId, executable: 'yt-dlp', errorCode: err.code },
+        cause: err
+      });
+    }
   }
 
   try {
     ffmpegProcess = spawnFn(ffmpegPath, ffmpegArgs, {
       shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: [directFfmpeg ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       windowsHide: true
     });
   } catch (err) {
@@ -389,12 +410,12 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     });
   }
 
-  ytdlpProcess.stderr?.on('data', (chunk) => appendBoundedStderr(ytdlpStderr, chunk));
+  ytdlpProcess?.stderr?.on('data', (chunk) => appendBoundedStderr(ytdlpStderr, chunk));
   ffmpegProcess.stderr?.on('data', (chunk) => appendBoundedStderr(ffmpegStderr, chunk));
 
   let immediateSpawnError = null;
 
-  ytdlpProcess.on('error', (err) => {
+  ytdlpProcess?.on('error', (err) => {
     const wrapped = new StreamExtractionError(
       `yt-dlp process error (${err.code || 'UNKNOWN'}): ${err.message}`,
       {
@@ -428,7 +449,7 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     recordFailure(wrapped);
   });
 
-  if (ytdlpProcess.stdout && ffmpegProcess.stdin) {
+  if (ytdlpProcess?.stdout && ffmpegProcess.stdin) {
     ytdlpProcess.stdout.on('data', (chunk) => {
       ytdlpBytes += chunk.length;
     });
@@ -489,7 +510,7 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
 
   pcmStream.on('error', () => {});
 
-  ytdlpProcess.once('close', (code, signal) => {
+  ytdlpProcess?.once('close', (code, signal) => {
     ytdlpExited = true;
     ytdlpExitCode = code ?? (signal ? -1 : 0);
 

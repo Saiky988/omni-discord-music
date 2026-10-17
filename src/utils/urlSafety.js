@@ -15,7 +15,8 @@ export const PLATFORM_DOMAINS = Object.freeze({
   tiktok: ['tiktok.com', 'www.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'm.tiktok.com'],
   douyin: ['douyin.com', 'www.douyin.com', 'v.douyin.com', 'iesdouyin.com'],
   facebook: ['facebook.com', 'www.facebook.com', 'm.facebook.com', 'web.facebook.com', 'fb.watch'],
-  instagram: ['instagram.com', 'www.instagram.com', 'ddinstagram.com']
+  instagram: ['instagram.com', 'www.instagram.com', 'ddinstagram.com'],
+  discord_cdn: ['cdn.discordapp.com', 'media.discordapp.net']
 });
 
 export const DIRECT_MEDIA_EXTENSIONS = Object.freeze([
@@ -25,7 +26,10 @@ export const DIRECT_MEDIA_EXTENSIONS = Object.freeze([
   '.wav',
   '.ogg',
   '.opus',
-  '.m3u8'
+  '.aac',
+  '.m3u8',
+  '.mp4',
+  '.webm'
 ]);
 
 export const ALLOWED_MEDIA_CONTENT_TYPES = Object.freeze([
@@ -69,12 +73,6 @@ const BLOCKED_HOSTNAME_SUFFIXES = [
   '.cluster.local'
 ];
 
-/**
- * Normalize a hostname (lowercase, strip trailing root dot and IPv6 brackets).
- *
- * @param {string} rawHostname
- * @returns {string}
- */
 export function normalizeHostname(rawHostname) {
   if (!rawHostname || typeof rawHostname !== 'string') {
     return '';
@@ -86,16 +84,6 @@ export function normalizeHostname(rawHostname) {
   return host;
 }
 
-/**
- * Exact or subdomain boundary check.
- * E.g. matchesDomain('www.youtube.com', ['youtube.com']) => true
- *      matchesDomain('evil-youtube.com', ['youtube.com']) => false
- *      matchesDomain('youtube.com.evil.org', ['youtube.com']) => false
- *
- * @param {string} hostname
- * @param {readonly string[]} allowedDomains
- * @returns {boolean}
- */
 export function matchesDomain(hostname, allowedDomains) {
   const normalized = normalizeHostname(hostname);
   if (!normalized) {
@@ -111,24 +99,18 @@ export function matchesDomain(hostname, allowedDomains) {
   return false;
 }
 
-/**
- * Detect whether a hostname is an obfuscated IPv4 literal (integer, hex, or octal)
- * such as 2130706433, 0x7f000001, or 0177.0.0.1.
- */
 export function isObfuscatedIpLiteral(hostname) {
   const host = normalizeHostname(hostname);
   if (!host) return false;
 
-  // Single integer or hex dword IP: 2130706433 or 0x7f000001
   if (/^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
     return true;
   }
 
-  // Dotted quad containing hex or leading-zero octal segments
   const parts = host.split('.');
   if (parts.length >= 2 && parts.length <= 4 && parts.every((p) => /^(0x[0-9a-f]+|\d+)$/i.test(p))) {
     if (parts.length !== 4) {
-      return true; // 2-part or 3-part short IPv4 notation like 127.1
+      return true;
     }
     for (const part of parts) {
       if (/^0x/i.test(part) || (part.length > 1 && part.startsWith('0'))) {
@@ -140,13 +122,6 @@ export function isObfuscatedIpLiteral(hostname) {
   return false;
 }
 
-/**
- * Check if an IPv4 address belongs to a loopback, private, link-local,
- * cloud metadata, CGNAT, multicast, broadcast, or reserved range.
- *
- * @param {string} ip
- * @returns {boolean}
- */
 export function isPrivateOrReservedIPv4(ip) {
   const parts = ip.split('.');
   if (parts.length !== 4) {
@@ -160,52 +135,30 @@ export function isPrivateOrReservedIPv4(ip) {
 
   const [a, b, c] = octets;
 
-  // 0.0.0.0/8 (Current network)
   if (a === 0) return true;
-  // 10.0.0.0/8 (Private)
   if (a === 10) return true;
-  // 100.64.0.0/10 (Carrier-grade NAT)
   if (a === 100 && b >= 64 && b <= 127) return true;
-  // 127.0.0.0/8 (Loopback)
   if (a === 127) return true;
-  // 169.254.0.0/16 (Link-local & Cloud IMDS 169.254.169.254)
   if (a === 169 && b === 254) return true;
-  // 172.16.0.0/12 (Private)
   if (a === 172 && b >= 16 && b <= 31) return true;
-  // 192.0.0.0/24 (IETF Protocol Assignments)
   if (a === 192 && b === 0 && c === 0) return true;
-  // 192.0.2.0/24 (TEST-NET-1)
   if (a === 192 && b === 0 && c === 2) return true;
-  // 192.88.99.0/24 (6to4 Relay Anycast)
   if (a === 192 && b === 88 && c === 99) return true;
-  // 192.168.0.0/16 (Private)
   if (a === 192 && b === 168) return true;
-  // 198.18.0.0/15 (Benchmarking)
   if (a === 198 && (b === 18 || b === 19)) return true;
-  // 198.51.100.0/24 (TEST-NET-2)
   if (a === 198 && b === 51 && c === 100) return true;
-  // 203.0.113.0/24 (TEST-NET-3)
   if (a === 203 && b === 0 && c === 113) return true;
-  // 224.0.0.0/4 (Multicast) & 240.0.0.0/4 (Reserved/Broadcast)
   if (a >= 224) return true;
 
   return false;
 }
 
-/**
- * Check if an IPv6 address is loopback, unspecified, link-local, unique-local,
- * multicast, or embeds a private IPv4 address.
- *
- * @param {string} rawIp
- * @returns {boolean}
- */
 export function isPrivateOrReservedIPv6(rawIp) {
-  const ip = normalizeHostname(rawIp).split('%')[0]; // Strip zone index if present
+  const ip = normalizeHostname(rawIp).split('%')[0];
   if (!ip || ip === '::' || ip === '::1' || ip === '0:0:0:0:0:0:0:1' || ip === '0:0:0:0:0:0:0:0') {
     return true;
   }
 
-  // IPv4-mapped IPv6 in dotted form (e.g. ::ffff:127.0.0.1 or ::ffff:169.254.169.254)
   if (ip.includes('.')) {
     const lastColon = ip.lastIndexOf(':');
     const ipv4Part = ip.slice(lastColon + 1);
@@ -215,7 +168,6 @@ export function isPrivateOrReservedIPv6(rawIp) {
     return true;
   }
 
-  // IPv4-mapped IPv6 in hex form (e.g. ::ffff:7f00:1 or 0:0:0:0:0:ffff:7f00:1)
   const normalizedHex = ip.replace(/^0+:0+:0+:0+:0+:ffff:/, '::ffff:');
   if (normalizedHex.startsWith('::ffff:')) {
     const rest = normalizedHex.slice(7);
@@ -230,21 +182,14 @@ export function isPrivateOrReservedIPv6(rawIp) {
     }
   }
 
-  // Unique local fc00::/7 (fc00..fdff)
   if (/^f[cd][0-9a-f]{2}:/i.test(ip)) return true;
-  // Link-local fe80::/10 (fe80..febf)
   if (/^fe[89ab][0-9a-f]:/i.test(ip)) return true;
-  // Multicast ff00::/8
   if (/^ff[0-9a-f]{2}:/i.test(ip)) return true;
-  // Documentation 2001:db8::/32
   if (/^2001:0?db8:/i.test(ip)) return true;
 
   return false;
 }
 
-/**
- * Determine whether an IP address (v4 or v6) is private, loopback, or reserved.
- */
 export function isUnsafeIpAddress(ip) {
   const clean = normalizeHostname(ip);
   const version = net.isIP(clean);
@@ -257,14 +202,6 @@ export function isUnsafeIpAddress(ip) {
   return true;
 }
 
-/**
- * Parse and validate a candidate URL for SSRF and protocol safety.
- *
- * @param {string} rawUrl
- * @param {object} [options]
- * @param {boolean} [options.allowHttp=false]
- * @returns {URL}
- */
 export function parseAndValidateUrl(rawUrl, options = {}) {
   const { allowHttp = false } = options;
 
@@ -336,7 +273,6 @@ export function parseAndValidateUrl(rawUrl, options = {}) {
       );
     }
   } else {
-    // Require a valid multi-label public domain name (reject single-label internal hosts like "redis" or "intranet")
     if (!hostname.includes('.')) {
       throw new UnsafeUrlError(
         `Blocked single-label internal hostname "${hostname}".`,
@@ -358,14 +294,10 @@ export function parseAndValidateUrl(rawUrl, options = {}) {
 
 /**
  * Identify the platform of a validated URL using strict hostname boundary checks.
- *
- * @param {URL} parsedUrl
- * @returns {string} Platform identifier or 'unknown'
  */
 export function detectUrlPlatform(parsedUrl) {
   const hostname = normalizeHostname(parsedUrl.hostname);
 
-  // Check YouTube Music before generic YouTube since music.youtube.com is a subdomain of youtube.com
   if (matchesDomain(hostname, PLATFORM_DOMAINS.youtube_music)) {
     return 'youtube_music';
   }
@@ -399,15 +331,29 @@ export function detectUrlPlatform(parsedUrl) {
     return 'direct_media';
   }
 
+  // Support Discord CDN attachments and signed CDN URLs with media extensions or mime params
+  if (matchesDomain(hostname, PLATFORM_DOMAINS.discord_cdn)) {
+    return 'direct_media';
+  }
+
+  const formatParam = (
+    parsedUrl.searchParams.get('format') ||
+    parsedUrl.searchParams.get('ext') ||
+    parsedUrl.searchParams.get('mime') ||
+    ''
+  ).toLowerCase();
+  if (
+    formatParam &&
+    (DIRECT_MEDIA_EXTENSIONS.some((ext) => formatParam === ext.slice(1) || formatParam.endsWith(ext)) ||
+      formatParam.startsWith('audio/') ||
+      formatParam.startsWith('video/'))
+  ) {
+    return 'direct_media';
+  }
+
   return 'unknown';
 }
 
-/**
- * Verify that all DNS records for a hostname resolve exclusively to public, non-reserved IPs.
- *
- * @param {string} hostname
- * @param {(host: string, options: object) => Promise<Array<{ address: string, family: number }>>} [lookupFn]
- */
 export async function assertPublicDnsResolution(hostname, lookupFn = dns.lookup) {
   const cleanHost = normalizeHostname(hostname);
   if (net.isIP(cleanHost)) {
@@ -446,21 +392,79 @@ export async function assertPublicDnsResolution(hostname, lookupFn = dns.lookup)
 }
 
 /**
+ * Safely resolve redirect hops for shortlinks (such as on.soundcloud.com, vt.tiktok.com, vm.tiktok.com)
+ * while enforcing SSRF checks on every hop.
+ */
+export async function resolveRedirectUrlSafely(initialUrl, options = {}) {
+  const {
+    allowHttp = false,
+    maxRedirects = 4,
+    timeoutMs = 6000,
+    fetchFn = globalThis.fetch,
+    lookupFn = dns.lookup
+  } = options;
+
+  let currentUrl = initialUrl instanceof URL
+    ? parseAndValidateUrl(initialUrl.toString(), { allowHttp })
+    : parseAndValidateUrl(String(initialUrl), { allowHttp });
+
+  if (typeof fetchFn !== 'function') {
+    return currentUrl;
+  }
+
+  for (let hop = 0; hop < maxRedirects; hop += 1) {
+    await assertPublicDnsResolution(currentUrl.hostname, lookupFn);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    timer.unref?.();
+
+    let response;
+    try {
+      response = await fetchFn(currentUrl.toString(), {
+        method: 'GET',
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)'
+        }
+      });
+    } catch {
+      clearTimeout(timer);
+      return currentUrl;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers?.get?.('location');
+      if (!location) {
+        return currentUrl;
+      }
+      try {
+        const nextCandidate = new URL(location, currentUrl);
+        currentUrl = parseAndValidateUrl(nextCandidate.toString(), { allowHttp });
+        continue;
+      } catch {
+        return currentUrl;
+      }
+    }
+
+    return currentUrl;
+  }
+
+  return currentUrl;
+}
+
+/**
  * Probe and validate a direct media URL, revalidating any redirect hops against SSRF rules
  * and verifying that the final response exposes a valid audio/media Content-Type.
- *
- * @param {URL | string} initialUrl
- * @param {object} [options]
- * @param {boolean} [options.allowHttp=false]
- * @param {number} [options.maxRedirects=3]
- * @param {number} [options.timeoutMs=8000]
- * @param {typeof fetch} [options.fetchFn=globalThis.fetch]
- * @param {typeof dns.lookup} [options.lookupFn=dns.lookup]
+ * Falls back to a ranged GET probe (`Range: bytes=0-0`) when a CDN rejects `HEAD` requests (403/405).
  */
 export async function validateDirectMediaUrl(initialUrl, options = {}) {
   const {
     allowHttp = false,
-    maxRedirects = 3,
+    maxRedirects = 4,
     timeoutMs = 8000,
     fetchFn = globalThis.fetch,
     lookupFn = dns.lookup
@@ -481,31 +485,39 @@ export async function validateDirectMediaUrl(initialUrl, options = {}) {
       };
     }
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    timer.unref?.();
+    const probeOnce = async (method, extraHeaders = {}) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      timer.unref?.();
+      try {
+        return await fetchFn(currentUrl.toString(), {
+          method,
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) omni-discord-music/1.0',
+            ...extraHeaders
+          }
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+    };
 
     let response;
     try {
-      response = await fetchFn(currentUrl.toString(), {
-        method: 'HEAD',
-        redirect: 'manual',
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'omni-discord-music/1.0'
-        }
-      });
+      response = await probeOnce('HEAD');
+      // Many signed CDNs (S3, Discord CDN, CloudFront, Akamai) reject HEAD with 403/405
+      if (response.status === 403 || response.status === 405 || response.status === 501) {
+        response = await probeOnce('GET', { Range: 'bytes=0-0' });
+      }
     } catch (err) {
-      clearTimeout(timer);
       throw new UnsupportedSourceError(
         `Failed to reach direct media URL: ${err.message}`,
         'Could not reach or validate the direct media URL.'
       );
-    } finally {
-      clearTimeout(timer);
     }
 
-    // Handle redirect hops manually so every destination is re-checked against SSRF rules
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       if (hop >= maxRedirects) {
         throw new UnsafeUrlError(

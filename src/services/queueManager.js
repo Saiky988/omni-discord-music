@@ -495,11 +495,20 @@ export class QueueManager {
     queue.currentTrack = track;
     queue.state = 'buffering';
 
+    // Use direct FFmpeg HTTP streaming when the track is a validated direct CDN link or TikWM CDN stream
+    const useDirectFfmpeg =
+      this.createStreamFn === defaultCreateAudioStream &&
+      (track.source === 'direct_media' ||
+        String(track.query || '').includes('tikwm.com/video/media/') ||
+        String(track.query || '').includes('cdn.discordapp.com') ||
+        String(track.query || '').includes('media.discordapp.net'));
+
     this.logger.info('Starting track playback', {
       guildId: queue.guildId,
       sessionId,
       title: track.title,
-      source: track.source
+      source: track.source,
+      directFfmpeg: useDirectFfmpeg
     });
 
     let streamSession;
@@ -507,6 +516,7 @@ export class QueueManager {
       streamSession = await this.createStreamFn(track.query, {
         sessionId,
         volume: queue.volume,
+        directFfmpeg: useDirectFfmpeg,
         metadata: {
           guildId: queue.guildId,
           sessionId,

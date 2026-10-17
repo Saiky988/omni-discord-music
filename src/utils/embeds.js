@@ -39,8 +39,9 @@ const LOOP_LABELS = Object.freeze({
 });
 
 /**
- * Escape user-controlled text so it cannot trigger @everyone/@here mentions,
- * misleading masked links, or runaway formatting blocks.
+ * Sanitize user-controlled text so it cannot trigger @everyone/@here mentions,
+ * break markdown links, or create runaway formatting blocks, without leaving
+ * visible backslash escapes like \(Demo\) inside link titles.
  */
 export function sanitizeDisplayText(text, maxLength = 256) {
   if (text === null || text === undefined) {
@@ -52,7 +53,9 @@ export function sanitizeDisplayText(text, maxLength = 256) {
     .replace(/@(everyone|here)/gi, '@\u200b$1')
     .replace(/<@!?(\d+)>/g, '@user')
     .replace(/<@&(\d+)>/g, '@role')
-    .replace(/([*_~`|\\[\]()])/g, '\\$1')
+    .replace(/\[/g, '(')
+    .replace(/\]/g, ')')
+    .replace(/[*_~`|\\]/g, '')
     .trim();
 
   if (!cleaned) {
@@ -230,7 +233,7 @@ export function buildPlaylistAddedEmbed(playlistInfo, queueResult, queueState = 
   const title = sanitizeDisplayText(playlistInfo?.title || 'Playlist', 140);
   const source = formatSourceLabel(playlistInfo?.source);
   const requester = sanitizeDisplayText(playlistInfo?.requestedBy || 'Unknown', 50);
-  const addedCount = queueResult.addedCount ?? 0;
+  const addedCount = playlistInfo?.totalQueuedCount ?? queueResult.addedCount ?? 0;
   const skippedCount = (playlistInfo?.skippedTracks ?? 0) + (queueResult.droppedByQueueLimit ?? 0);
 
   const titleLine = playlistInfo?.webpageUrl
@@ -241,7 +244,9 @@ export function buildPlaylistAddedEmbed(playlistInfo, queueResult, queueState = 
   if (skippedCount > 0) {
     summaryParts.push(`*(${skippedCount} skipped)*`);
   }
-  if (queueState.upcomingCount > 0) {
+  if (playlistInfo?.backgroundLoadingCount > 0) {
+    summaryParts.push(`• \`loading ${playlistInfo.backgroundLoadingCount} in background\``);
+  } else if (queueState.upcomingCount > 0) {
     summaryParts.push(`• \`${queueState.upcomingCount} waiting\``);
   }
 

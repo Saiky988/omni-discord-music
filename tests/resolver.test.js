@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SourceResolver,
-  BoundedMetadataCache
+  BoundedMetadataCache,
+  selectBestSearchCandidate
 } from '../src/services/resolver.js';
 import {
   matchesDomain,
@@ -90,6 +91,30 @@ function createMockResolver(overrides = {}) {
       };
     }
 
+    if (target.includes('track-stations:')) {
+      return {
+        _type: 'playlist',
+        title: 'Related tracks: Shared Single Song',
+        entries: [
+          {
+            id: 'sc1',
+            title: 'Shared Single Song (Demo)',
+            uploader: 'Quinvy',
+            webpage_url: 'https://soundcloud.com/quinvy/shared-single-song',
+            duration: 190,
+            formats: [{ acodec: 'mp3', ext: 'mp3' }]
+          },
+          {
+            id: 'sc2',
+            title: 'Unwanted Related Track 2',
+            uploader: 'Other',
+            webpage_url: 'https://soundcloud.com/other/related-2',
+            duration: 210
+          }
+        ]
+      };
+    }
+
     return {
       id: 'direct_1',
       title: 'Direct Platform Track',
@@ -104,8 +129,11 @@ function createMockResolver(overrides = {}) {
 
   return new SourceResolver({
     config: testConfig,
-    playDl: null,
+    playDl: overrides.playDl ?? null,
     ytdlpExtract: overrides.ytdlpExtract || defaultYtdlpExtract,
+    redirectResolver:
+      overrides.redirectResolver ||
+      (async (parsedUrl) => parsedUrl),
     spotifyMetadataResolver:
       overrides.spotifyMetadataResolver ||
       (async (_url, classification) => {
@@ -183,7 +211,7 @@ test('Resolver — valid YouTube and YouTube Music URLs resolve to normalized co
   assert.equal(ytmResult.source, 'youtube_music');
 });
 
-test('Resolver — Spotify track and playlist URLs preserve metadata, use fallback search, and enforce limits', async () => {
+test('Resolver — Spotify track, duration-matched search candidate selection, and eager first-track playlist loading', async () => {
   const resolver = createMockResolver();
 
   const trackRes = await resolver.resolve(
@@ -196,10 +224,30 @@ test('Resolver — Spotify track and playlist URLs preserve metadata, use fallba
   assert.equal(trackRes.artist, 'The Weeknd');
   assert.equal(trackRes.source, 'spotify');
   assert.equal(trackRes.isFallback, true);
-  // Must NOT use raw Spotify URL as the audio stream query
   assert.notEqual(trackRes.query, 'https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT');
   assert.equal(trackRes.query, 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
 
+  // Verify candidate scoring picks "chess" by "joyful" (124s) over "Brainy Chess" (489s)
+  const bestCandidate = selectBestSearchCandidate(
+    [
+      {
+        title: 'chess',
+        channel: { name: 'Brainy Chess' },
+        durationInSec: 489,
+        url: 'https://www.youtube.com/watch?v=wrong_chess_video'
+      },
+      {
+        title: 'joyful - chess (Official Audio)',
+        channel: { name: 'joyful - Topic' },
+        durationInSec: 124,
+        url: 'https://www.youtube.com/watch?v=right_joyful_chess'
+      }
+    ],
+    { title: 'chess', artist: 'joyful', duration: 124 }
+  );
+  assert.equal(bestCandidate.url, 'https://www.youtube.com/watch?v=right_joyful_chess');
+
+  // Full synchronous playlist resolution
   const playlistRes = await resolver.resolve(
     'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M',
     { requestedBy: 'user1' }
@@ -208,11 +256,41 @@ test('Resolver — Spotify track and playlist URLs preserve metadata, use fallba
   assert.equal(playlistRes.kind, 'playlist');
   assert.equal(playlistRes.title, 'Synthwave Essentials');
   assert.equal(playlistRes.truncated, true);
-  // 5 total items: sliced to MAX_PLAYLIST_TRACKS (3), and 1 of the first 3 is unavailable -> 2 playable tracks, 3 skipped
   assert.equal(playlistRes.tracks.length, 2);
   assert.equal(playlistRes.skippedTracks, 3);
-  assert.equal(playlistRes.tracks[0].title, 'Nightcall');
-  assert.equal(playlistRes.tracks[1].title, 'Blinding Lights');
+
+  // Eager first-track playlist resolution returns Track #1 immediately and loads Track #2 in background
+  const eagerRes = await resolver.resolve(
+    'https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M',
+    { requestedBy: 'user1', eagerFirstTrackOnly: true }
+  );
+  assert.equal(eagerRes.kind, 'playlist');
+  assert.equal(eagerRes.tracks.length, 1);
+  assert.equal(eagerRes.tracks[0].title, 'Nightcall');
+  assert.equal(typeof eagerRes.backgroundTasks, 'function');
+
+  const bgTracks = [];
+  await eagerRes.backgroundTasks(async (t) => {
+    bgTracks.push(t);
+  });
+  assert.equal(bgTracks.length, 1);
+  assert.equal(bgTracks[0].title, 'Blinding Lights');
+});
+
+test('Resolver — SoundCloud mobile share (on.soundcloud.com -> track-stations) extracts single shared track immediately', async () => {
+  const resolver = createMockResolver({
+    redirectResolver: async () =>
+      new URL('https://soundcloud.com/discover/sets/track-stations:123456789?si=abc')
+  });
+
+  const scShareRes = await resolver.resolve('https://on.soundcloud.com/YGk1ZFz55VOEQVeXkh', {
+    requestedBy: 'nvirya'
+  });
+
+  assert.equal(scShareRes.kind, 'track');
+  assert.equal(scShareRes.title, 'Shared Single Song (Demo)');
+  assert.equal(scShareRes.artist, 'Quinvy');
+  assert.equal(scShareRes.query, 'https://soundcloud.com/quinvy/shared-single-song');
 });
 
 test('Resolver — Apple Music track and album URLs resolve via fallback search', async () => {
@@ -235,7 +313,7 @@ test('Resolver — Apple Music track and album URLs resolve via fallback search'
   assert.equal(albumRes.tracks.length, 2);
 });
 
-test('Resolver — SoundCloud and TikTok URLs and silent photo carousel detection', async () => {
+test('Resolver — SoundCloud, TikTok, Discord CDN, and silent photo carousel detection', async () => {
   const resolver = createMockResolver();
 
   const scRes = await resolver.resolve('https://soundcloud.com/artist/track-name');
@@ -244,6 +322,12 @@ test('Resolver — SoundCloud and TikTok URLs and silent photo carousel detectio
 
   const ttRes = await resolver.resolve('https://www.tiktok.com/@creator/video/7123456789');
   assert.equal(ttRes.source, 'tiktok');
+
+  const cdnRes = await resolver.resolve(
+    'https://cdn.discordapp.com/attachments/111/222/mysong.mp3?ex=123'
+  );
+  assert.equal(cdnRes.source, 'direct_media');
+  assert.equal(cdnRes.title, 'mysong');
 
   await assert.rejects(
     () => resolver.resolve('https://www.tiktok.com/@creator/video/photo-silent'),
@@ -337,7 +421,6 @@ test('BoundedMetadataCache — evicts oldest entries when capacity is exceeded',
   const cache = new BoundedMetadataCache({ maxEntries: 2, ttlMs: 10000 });
   cache.set('k1', { title: 'One' });
   cache.set('k2', { title: 'Two' });
-  // Access k1 so k2 becomes the oldest
   assert.deepEqual(cache.get('k1'), { title: 'One' });
   cache.set('k3', { title: 'Three' });
 
