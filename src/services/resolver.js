@@ -1,4 +1,5 @@
 import { spawn as defaultSpawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import config from '../config.js';
 import { logger as defaultLogger } from '../utils/logger.js';
@@ -39,7 +40,6 @@ export class BoundedMetadataCache {
       this.store.delete(key);
       return null;
     }
-    // Refresh LRU order
     this.store.delete(key);
     this.store.set(key, entry);
     return structuredClone(entry.value);
@@ -68,15 +68,6 @@ export class BoundedMetadataCache {
   }
 }
 
-/**
- * Run async tasks with a strict concurrency cap while preserving deterministic input order.
- *
- * @template T, R
- * @param {T[]} items
- * @param {number} concurrency
- * @param {(item: T, index: number) => Promise<R>} mapper
- * @returns {Promise<R[]>}
- */
 export async function mapWithConcurrency(items, concurrency, mapper) {
   const limit = Math.max(1, Number.parseInt(String(concurrency), 10) || 3);
   const results = new Array(items.length);
@@ -95,9 +86,6 @@ export async function mapWithConcurrency(items, concurrency, mapper) {
   return results;
 }
 
-/**
- * Determine whether user input looks like a URL or URI scheme rather than a plain-text search query.
- */
 export function isUrlCandidate(input) {
   const trimmed = input.trim();
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
@@ -110,8 +98,55 @@ export function isUrlCandidate(input) {
 }
 
 /**
- * Normalize a single track into the canonical contract required across the bot.
+ * Extract canonical YouTube video ID from youtube.com or youtu.be URLs.
  */
+export function extractYouTubeVideoId(parsedUrl) {
+  const host = parsedUrl.hostname.toLowerCase();
+  if (host === 'youtu.be') {
+    const id = parsedUrl.pathname.split('/').filter(Boolean)[0];
+    return id && /^[A-Za-z0-9_-]{6,20}$/.test(id) ? id : null;
+  }
+  const v = parsedUrl.searchParams.get('v');
+  if (v && /^[A-Za-z0-9_-]{6,20}$/.test(v)) {
+    return v;
+  }
+  const segments = parsedUrl.pathname.split('/').filter(Boolean);
+  if ((segments[0] === 'shorts' || segments[0] === 'live' || segments[0] === 'embed') && segments[1]) {
+    return /^[A-Za-z0-9_-]{6,20}$/.test(segments[1]) ? segments[1] : null;
+  }
+  return null;
+}
+
+/**
+ * Canonicalize YouTube short/share URLs (e.g. https://youtu.be/6GBiu04y5gY?si=...)
+ * by stripping tracking parameters (`si`, `feature`, `pp`).
+ */
+export function canonicalizeYouTubeUrl(parsedUrl, platform) {
+  const videoId = extractYouTubeVideoId(parsedUrl);
+  if (!videoId) {
+    return parsedUrl.toString();
+  }
+  if (platform === 'youtube_music') {
+    return `https://music.youtube.com/watch?v=${videoId}`;
+  }
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+/**
+ * Resolve optional cookies.txt path if present on disk.
+ */
+export function resolveOptionalCookiesPath() {
+  const envCookiePath = process.env.YTDLP_COOKIES_PATH?.trim();
+  if (envCookiePath && fs.existsSync(envCookiePath)) {
+    return envCookiePath;
+  }
+  const defaultCookiePath = path.resolve(process.cwd(), 'cookies.txt');
+  if (fs.existsSync(defaultCookiePath)) {
+    return defaultCookiePath;
+  }
+  return null;
+}
+
 export function createNormalizedTrack({
   title,
   artist = null,
@@ -134,7 +169,7 @@ export function createNormalizedTrack({
       ? Math.round(Number(duration))
       : null;
 
-  const track = {
+  return {
     title: normalizedTitle,
     artist: artist && String(artist).trim() ? String(artist).trim() : null,
     query: String(query).trim(),
@@ -147,15 +182,8 @@ export function createNormalizedTrack({
     isFallback: Boolean(isFallback),
     originalSource: originalSource || null
   };
-
-  return track;
 }
 
-/**
- * Wrap a single normalized track into a result envelope that exposes both top-level
- * single-track fields (title, query, source, thumbnail, duration, webpageUrl, isLive, requestedBy)
- * and explicit collection fields (kind: 'track', track, tracks: [track]).
- */
 export function wrapSingleTrackResult(track, warnings = []) {
   return {
     kind: 'track',
@@ -177,9 +205,6 @@ export function wrapSingleTrackResult(track, warnings = []) {
   };
 }
 
-/**
- * Wrap multiple normalized tracks into an explicit playlist result contract.
- */
 export function wrapPlaylistResult({
   title,
   source,
@@ -216,164 +241,218 @@ export function wrapPlaylistResult({
   };
 }
 
+function runYtdlpJsonProcess({
+  spawnFn,
+  ytdlpPath,
+  args,
+  timeoutMs
+}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawnFn(ytdlpPath, args, {
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
+      });
+    } catch (err) {
+      reject(
+        new ResolutionError(
+          `Failed to spawn yt-dlp metadata extractor: ${err.message}`,
+          'Audio resolver executable could not be started.',
+          { code: err.code },
+          err
+        )
+      );
+      return;
+    }
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const maxStdoutBytes = 32 * 1024 * 1024;
+    const maxStderrBytes = 8192;
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // Ignore kill error
+      }
+      reject(
+        new ResolutionError(
+          `yt-dlp metadata resolution timed out after ${timeoutMs}ms.`,
+          'Timed out while fetching track information.'
+        )
+      );
+    }, timeoutMs);
+    timer.unref?.();
+
+    child.stdout?.on('data', (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      if (stdoutBytes < maxStdoutBytes) {
+        stdoutChunks.push(buf);
+        stdoutBytes += buf.length;
+      }
+    });
+
+    child.stderr?.on('data', (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      if (stderrBytes < maxStderrBytes) {
+        stderrChunks.push(buf.subarray(0, maxStderrBytes - stderrBytes));
+        stderrBytes += buf.length;
+      }
+    });
+
+    child.once('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const userMessage =
+        err.code === 'ENOENT'
+          ? 'The yt-dlp extractor binary is not installed on the server.'
+          : 'Failed to execute media metadata extractor.';
+      reject(new ResolutionError(`yt-dlp spawn error: ${err.message}`, userMessage, { code: err.code }, err));
+    });
+
+    child.once('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+
+      const stderrText = Buffer.concat(stderrChunks).toString('utf8').trim();
+      if (code !== 0) {
+        if (/no video formats|no audio|image|photo|slideshow/i.test(stderrText)) {
+          reject(
+            new UnsupportedMediaError(
+              `Media does not contain an extractable audio stream: ${stderrText}`,
+              'This post or photo carousel does not contain a playable audio stream.'
+            )
+          );
+          return;
+        }
+        reject(
+          new ResolutionError(
+            `yt-dlp exited with code ${code}: ${stderrText || 'unknown error'}`,
+            'Could not resolve playable media from the provided input.',
+            { exitCode: code, stderr: stderrText }
+          )
+        );
+        return;
+      }
+
+      const rawJson = Buffer.concat(stdoutChunks).toString('utf8').trim();
+      if (!rawJson) {
+        reject(
+          new ResolutionError(
+            'yt-dlp returned empty metadata output.',
+            'No media results were found.'
+          )
+        );
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(rawJson);
+        resolve(parsed);
+      } catch (err) {
+        reject(
+          new ResolutionError(
+            `Failed to parse yt-dlp JSON output: ${err.message}`,
+            'Received malformed metadata from media extractor.',
+            {},
+            err
+          )
+        );
+      }
+    });
+  });
+}
+
 /**
- * Default yt-dlp JSON metadata extractor using child_process.spawn with argument arrays.
+ * Default yt-dlp JSON metadata extractor with Node.js EJS runtime enabled
+ * and automatic multi-client retry on YouTube URLs.
  */
 export function createYtdlpMetadataExtractor({
   spawnFn = defaultSpawn,
   ytdlpPath = config.YTDLP_PATH,
   timeoutMs = config.RESOLVE_TIMEOUT_MS,
-  maxPlaylistTracks = config.MAX_PLAYLIST_TRACKS
+  maxPlaylistTracks = config.MAX_PLAYLIST_TRACKS,
+  logger = defaultLogger
 } = {}) {
   return async function extractWithYtdlp(target, { allowPlaylist = false } = {}) {
     if (!target || typeof target !== 'string' || target.startsWith('-')) {
       throw new InvalidInputError('Invalid extraction target.');
     }
 
-    const args = [
+    const cookiesPath = resolveOptionalCookiesPath();
+    const baseArgs = [
       '--dump-single-json',
       '--no-warnings',
-      '--quiet',
+      '--no-check-certificates',
+      '--geo-bypass',
+      '--force-ipv4',
       '--skip-download'
     ];
 
-    if (allowPlaylist) {
-      args.push('--flat-playlist', '--playlist-end', String(maxPlaylistTracks + 1));
-    } else {
-      args.push('--no-playlist');
+    if (cookiesPath) {
+      baseArgs.push('--cookies', cookiesPath);
     }
 
-    args.push('--', target);
+    if (allowPlaylist) {
+      baseArgs.push('--flat-playlist', '--playlist-end', String(maxPlaylistTracks + 1));
+    } else {
+      baseArgs.push('--no-playlist');
+    }
 
-    return new Promise((resolve, reject) => {
-      let child;
-      try {
-        child = spawnFn(ytdlpPath, args, {
-          shell: false,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          windowsHide: true
-        });
-      } catch (err) {
-        reject(
-          new ResolutionError(
-            `Failed to spawn yt-dlp metadata extractor: ${err.message}`,
-            'Audio resolver executable could not be started.',
-            { code: err.code },
-            err
-          )
-        );
-        return;
+    const firstAttemptArgs = [
+      ...baseArgs,
+      '--js-runtimes',
+      'node',
+      '--',
+      target
+    ];
+
+    try {
+      return await runYtdlpJsonProcess({
+        spawnFn,
+        ytdlpPath,
+        args: firstAttemptArgs,
+        timeoutMs
+      });
+    } catch (firstErr) {
+      if (firstErr instanceof UnsupportedMediaError || firstErr?.context?.code === 'ENOENT') {
+        throw firstErr;
       }
 
-      const stdoutChunks = [];
-      const stderrChunks = [];
-      let stdoutBytes = 0;
-      let stderrBytes = 0;
-      const maxStdoutBytes = 5 * 1024 * 1024;
-      const maxStderrBytes = 4096;
-      let settled = false;
-
-      const timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        try {
-          child.kill('SIGTERM');
-        } catch {
-          // Ignore kill errors
-        }
-        reject(
-          new ResolutionError(
-            `yt-dlp metadata resolution timed out after ${timeoutMs}ms.`,
-            'Timed out while fetching track information.'
-          )
-        );
-      }, timeoutMs);
-      timer.unref?.();
-
-      child.stdout?.on('data', (chunk) => {
-        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-        if (stdoutBytes < maxStdoutBytes) {
-          stdoutChunks.push(buf);
-          stdoutBytes += buf.length;
-        }
+      logger.warn?.('Primary yt-dlp metadata extraction failed; retrying with fallback multi-client arguments', {
+        target,
+        error: firstErr.message
       });
 
-      child.stderr?.on('data', (chunk) => {
-        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-        if (stderrBytes < maxStderrBytes) {
-          stderrChunks.push(buf.subarray(0, maxStderrBytes - stderrBytes));
-          stderrBytes += buf.length;
-        }
+      const retryArgs = [
+        ...baseArgs,
+        '--ignore-no-formats-error',
+        '--extractor-args',
+        'youtube:player_client=android_vr,tv,web_safari,mweb,default',
+        '--',
+        target
+      ];
+
+      return runYtdlpJsonProcess({
+        spawnFn,
+        ytdlpPath,
+        args: retryArgs,
+        timeoutMs
       });
-
-      child.once('error', (err) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        const userMessage =
-          err.code === 'ENOENT'
-            ? 'The yt-dlp extractor binary is not installed on the server.'
-            : 'Failed to execute media metadata extractor.';
-        reject(new ResolutionError(`yt-dlp spawn error: ${err.message}`, userMessage, { code: err.code }, err));
-      });
-
-      child.once('close', (code) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-
-        const stderrText = Buffer.concat(stderrChunks).toString('utf8').trim();
-        if (code !== 0) {
-          if (/no video formats|no audio|image|photo|slideshow/i.test(stderrText)) {
-            reject(
-              new UnsupportedMediaError(
-                `Media does not contain an extractable audio stream: ${stderrText}`,
-                'This post or photo carousel does not contain a playable audio stream.'
-              )
-            );
-            return;
-          }
-          reject(
-            new ResolutionError(
-              `yt-dlp exited with code ${code}: ${stderrText || 'unknown error'}`,
-              'Could not resolve playable media from the provided input.'
-            )
-          );
-          return;
-        }
-
-        const rawJson = Buffer.concat(stdoutChunks).toString('utf8').trim();
-        if (!rawJson) {
-          reject(
-            new ResolutionError(
-              'yt-dlp returned empty metadata output.',
-              'No media results were found.'
-            )
-          );
-          return;
-        }
-
-        try {
-          const parsed = JSON.parse(rawJson);
-          resolve(parsed);
-        } catch (err) {
-          reject(
-            new ResolutionError(
-              `Failed to parse yt-dlp JSON output: ${err.message}`,
-              'Received malformed metadata from media extractor.',
-              {},
-              err
-            )
-          );
-        }
-      });
-    });
+    }
   };
 }
 
-/**
- * Classify Spotify URL path into 'track' | 'album' | 'playlist'.
- */
 export function parseSpotifyUrlType(parsedUrl) {
   const segments = parsedUrl.pathname
     .split('/')
@@ -389,9 +468,6 @@ export function parseSpotifyUrlType(parsedUrl) {
   return null;
 }
 
-/**
- * Classify Apple Music URL path into 'track' | 'album' | 'playlist'.
- */
 export function parseAppleMusicUrlType(parsedUrl) {
   const segments = parsedUrl.pathname.split('/').filter(Boolean);
   const hasTrackParam = Boolean(parsedUrl.searchParams.get('i'));
@@ -410,9 +486,6 @@ export function parseAppleMusicUrlType(parsedUrl) {
   return null;
 }
 
-/**
- * Determine whether a YouTube or SoundCloud URL represents a playlist.
- */
 export function isPlaylistUrl(parsedUrl, platform) {
   if (platform === 'youtube' || platform === 'youtube_music') {
     if (parsedUrl.pathname === '/playlist' && parsedUrl.searchParams.has('list')) {
@@ -432,10 +505,6 @@ export function isPlaylistUrl(parsedUrl, platform) {
   return false;
 }
 
-/**
- * Verify that yt-dlp metadata actually exposes an audio-capable format or stream
- * (protects against silent TikTok/Douyin photo carousels or image-only posts).
- */
 export function assertPlayableAudioMetadata(meta, platform) {
   if (!meta || typeof meta !== 'object') {
     throw new ResolutionError('Empty metadata returned by extractor.');
@@ -445,7 +514,7 @@ export function assertPlayableAudioMetadata(meta, platform) {
     const hasAudioFormat = meta.formats.some(
       (f) =>
         (f.acodec && f.acodec !== 'none') ||
-        (typeof f.ext === 'string' && ['mp3', 'm4a', 'opus', 'ogg', 'wav', 'aac', 'flac'].includes(f.ext)) ||
+        (typeof f.ext === 'string' && ['mp3', 'm4a', 'opus', 'ogg', 'wav', 'aac', 'flac', 'mp4', 'webm'].includes(f.ext)) ||
         Boolean(f.audio_ext && f.audio_ext !== 'none')
     );
 
@@ -463,10 +532,6 @@ export function assertPlayableAudioMetadata(meta, platform) {
   }
 }
 
-/**
- * Create a configurable SourceResolver instance.
- * Supports full dependency injection for unit testing without live external services.
- */
 export class SourceResolver {
   constructor(options = {}) {
     this.config = options.config || config;
@@ -478,7 +543,8 @@ export class SourceResolver {
         spawnFn: options.spawnFn,
         ytdlpPath: this.config.YTDLP_PATH,
         timeoutMs: this.config.RESOLVE_TIMEOUT_MS,
-        maxPlaylistTracks: this.config.MAX_PLAYLIST_TRACKS
+        maxPlaylistTracks: this.config.MAX_PLAYLIST_TRACKS,
+        logger: this.logger
       });
     this.spotifyMetadataResolver = options.spotifyMetadataResolver || null;
     this.appleMusicMetadataResolver = options.appleMusicMetadataResolver || null;
@@ -491,14 +557,6 @@ export class SourceResolver {
       });
   }
 
-  /**
-   * Main entry point to resolve a user-supplied URL or search query.
-   *
-   * @param {string} rawInput
-   * @param {object} [options]
-   * @param {string} [options.requestedBy=null]
-   * @returns {Promise<object>} Normalized track or playlist contract
-   */
   async resolve(rawInput, options = {}) {
     const requestedBy = options.requestedBy ?? null;
 
@@ -538,7 +596,6 @@ export class SourceResolver {
       return this.resolveUrl(parsedUrl, { requestedBy });
     }
 
-    // Check if the user passed something that looks like a bare internal host/IP exploit
     if (
       /^[a-z0-9.-]+:\d+\//i.test(trimmed) ||
       /^(localhost|127\.0\.0\.1|169\.254\.169\.254|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)([:/]|$)/i.test(trimmed)
@@ -552,9 +609,6 @@ export class SourceResolver {
     return this.resolveSearchQuery(trimmed, { requestedBy });
   }
 
-  /**
-   * Resolve a plain-text search query into a playable track via YouTube or SoundCloud search.
-   */
   async resolveSearchQuery(queryText, { requestedBy = null, preferredFallback = 'youtube', originalMeta = null } = {}) {
     const cleanQuery = queryText.replace(/\s+/g, ' ').trim();
     if (!cleanQuery || cleanQuery.length < 2) {
@@ -582,7 +636,6 @@ export class SourceResolver {
       return wrapSingleTrackResult(track);
     }
 
-    // 1. Try play-dl YouTube search if available and healthy
     if (this.playDl && typeof this.playDl.search === 'function' && preferredFallback === 'youtube') {
       try {
         const results = await this.playDl.search(cleanQuery, {
@@ -627,7 +680,6 @@ export class SourceResolver {
       }
     }
 
-    // 2. Extract via yt-dlp ytsearch1: or scsearch1:
     const searchPrefixes = preferredFallback === 'soundcloud'
       ? ['scsearch1', 'ytsearch1']
       : ['ytsearch1', 'scsearch1'];
@@ -695,9 +747,6 @@ export class SourceResolver {
     );
   }
 
-  /**
-   * Resolve a validated URL based on its detected platform.
-   */
   async resolveUrl(parsedUrl, { requestedBy = null } = {}) {
     const platform = detectUrlPlatform(parsedUrl);
     if (platform === 'unknown') {
@@ -726,9 +775,6 @@ export class SourceResolver {
     return this.resolveExtractorSingle(parsedUrl, platform, { requestedBy });
   }
 
-  /**
-   * Resolve a direct media URL (.mp3, .m4a, .flac, .wav, .ogg, .opus, .m3u8) after SSRF and header checks.
-   */
   async resolveDirectMedia(parsedUrl, { requestedBy = null } = {}) {
     const validation = await this.directMediaValidator(parsedUrl, {
       allowHttp: Boolean(this.config.ALLOW_HTTP_MEDIA)
@@ -754,11 +800,72 @@ export class SourceResolver {
     return wrapSingleTrackResult(track);
   }
 
-  /**
-   * Resolve a single track URL from YouTube, YouTube Music, SoundCloud, TikTok, Douyin, Facebook, or Instagram.
-   */
+  async fallbackResolveYouTubeMetadata(canonicalUrl, platform) {
+    if (this.playDl && typeof this.playDl.video_basic_info === 'function') {
+      try {
+        const info = await this.playDl.video_basic_info(canonicalUrl);
+        const details = info?.video_details;
+        if (details?.title) {
+          const duration = Number.isFinite(details.durationInSec) ? details.durationInSec : null;
+          const isLive = Boolean(details.live);
+          this.assertDurationAllowed(duration, isLive);
+          return {
+            title: details.title,
+            artist: details.channel?.name || null,
+            query: canonicalUrl,
+            source: platform,
+            thumbnail: details.thumbnails?.[0]?.url || null,
+            duration,
+            webpageUrl: canonicalUrl,
+            isLive
+          };
+        }
+      } catch (err) {
+        this.logger.debug('play-dl video_basic_info fallback failed', {
+          url: canonicalUrl,
+          error: err.message
+        });
+      }
+    }
+
+    if (typeof globalThis.fetch === 'function') {
+      try {
+        const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(canonicalUrl)}&format=json`;
+        const res = await globalThis.fetch(oembedUrl, {
+          headers: { 'User-Agent': 'omni-discord-music/1.0' }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.title) {
+            return {
+              title: data.title,
+              artist: data.author_name || null,
+              query: canonicalUrl,
+              source: platform,
+              thumbnail: data.thumbnail_url || null,
+              duration: null,
+              webpageUrl: canonicalUrl,
+              isLive: false
+            };
+          }
+        }
+      } catch (err) {
+        this.logger.debug('YouTube oEmbed fallback failed', {
+          url: canonicalUrl,
+          error: err.message
+        });
+      }
+    }
+
+    return null;
+  }
+
   async resolveExtractorSingle(parsedUrl, platform, { requestedBy = null } = {}) {
-    const urlStr = parsedUrl.toString();
+    const isYt = platform === 'youtube' || platform === 'youtube_music';
+    const urlStr = isYt
+      ? canonicalizeYouTubeUrl(parsedUrl, platform)
+      : parsedUrl.toString();
+
     const cacheKey = `url:${urlStr}`;
     const cached = this.cache.get(cacheKey);
     if (cached) {
@@ -769,7 +876,34 @@ export class SourceResolver {
       return wrapSingleTrackResult(track);
     }
 
-    const meta = await this.ytdlpExtract(urlStr, { allowPlaylist: false });
+    let meta = null;
+    let ytdlpError = null;
+
+    try {
+      meta = await this.ytdlpExtract(urlStr, { allowPlaylist: false });
+    } catch (err) {
+      ytdlpError = err;
+      if (!isYt || err instanceof UnsupportedMediaError || err instanceof InvalidInputError) {
+        throw err;
+      }
+      this.logger.warn('yt-dlp metadata extraction failed on YouTube URL; attempting play-dl / oEmbed fallback', {
+        url: urlStr,
+        error: err.message
+      });
+    }
+
+    if (!meta && isYt) {
+      const fallbackData = await this.fallbackResolveYouTubeMetadata(urlStr, platform);
+      if (fallbackData) {
+        this.cache.set(cacheKey, fallbackData);
+        const track = createNormalizedTrack({
+          ...fallbackData,
+          requestedBy
+        });
+        return wrapSingleTrackResult(track);
+      }
+      throw ytdlpError || new ResolutionError('Could not resolve YouTube track metadata.');
+    }
 
     if (meta?._type === 'playlist' && Array.isArray(meta.entries)) {
       return this.buildPlaylistFromEntries(meta, platform, urlStr, requestedBy);
@@ -806,9 +940,6 @@ export class SourceResolver {
     return wrapSingleTrackResult(track);
   }
 
-  /**
-   * Resolve a YouTube / YouTube Music / SoundCloud playlist URL.
-   */
   async resolveExtractorPlaylist(parsedUrl, platform, { requestedBy = null } = {}) {
     const urlStr = parsedUrl.toString();
     const meta = await this.ytdlpExtract(urlStr, { allowPlaylist: true });
@@ -912,9 +1043,6 @@ export class SourceResolver {
     });
   }
 
-  /**
-   * Resolve Spotify track, album, or playlist URLs.
-   */
   async resolveSpotifyUrl(parsedUrl, { requestedBy = null } = {}) {
     const classification = parseSpotifyUrlType(parsedUrl);
     if (!classification) {
@@ -957,9 +1085,6 @@ export class SourceResolver {
     });
   }
 
-  /**
-   * Resolve Apple Music track, album, or playlist URLs.
-   */
   async resolveAppleMusicUrl(parsedUrl, { requestedBy = null } = {}) {
     const classification = parseAppleMusicUrlType(parsedUrl);
     if (!classification) {
@@ -1002,10 +1127,6 @@ export class SourceResolver {
     });
   }
 
-  /**
-   * Map a metadata collection (Spotify or Apple Music album/playlist) into playable tracks
-   * in deterministic order with bounded concurrency and playlist size enforcement.
-   */
   async resolveMetadataCollection(collectionMeta, { platform, webpageUrl, requestedBy }) {
     const rawItems = Array.isArray(collectionMeta?.tracks) ? collectionMeta.tracks : [];
     if (rawItems.length === 0) {
@@ -1086,9 +1207,6 @@ export class SourceResolver {
     });
   }
 
-  /**
-   * Fetch Spotify metadata via injected resolver, play-dl, or Spotify public oEmbed endpoint.
-   */
   async fetchSpotifyMetadata(parsedUrl, classification) {
     if (typeof this.spotifyMetadataResolver === 'function') {
       return this.spotifyMetadataResolver(parsedUrl, classification);
@@ -1163,9 +1281,6 @@ export class SourceResolver {
     );
   }
 
-  /**
-   * Fetch Apple Music metadata via injected resolver or Apple iTunes Lookup API.
-   */
   async fetchAppleMusicMetadata(parsedUrl, classification) {
     if (typeof this.appleMusicMetadataResolver === 'function') {
       return this.appleMusicMetadataResolver(parsedUrl, classification);

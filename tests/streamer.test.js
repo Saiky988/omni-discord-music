@@ -43,9 +43,17 @@ test('Streamer — builds high-quality yt-dlp and ffmpeg arguments and rejects u
   const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   assert.deepEqual(buildYtdlpArgs(url), [
     '-f',
-    'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best',
+    'bestaudio/best',
     '--no-playlist',
     '--quiet',
+    '--no-warnings',
+    '--no-check-certificates',
+    '--geo-bypass',
+    '--force-ipv4',
+    '--js-runtimes',
+    'node',
+    '--extractor-args',
+    'youtube:player_client=default,android_vr,tv,web_safari,mweb',
     '-o',
     '-',
     url

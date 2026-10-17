@@ -2,6 +2,8 @@ import { spawn as defaultSpawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import config from '../config.js';
 import { createAudioResource, StreamType } from '../utils/discordSdk.js';
 import { logger as defaultLogger, redactSensitiveString } from '../utils/logger.js';
@@ -18,19 +20,15 @@ const DOCUMENTED_SEARCH_TARGET_PATTERN = /^(ytsearch1|scsearch1):[^\0\r\n]{2,500
 /**
  * High-precision real-time audio mastering filter for Discord 48kHz stereo PCM:
  * 1. Polyphase Sinc resampler (swr, filter_size=32, linear_interp=1) to 48kHz in float domain
- *    eliminates sample-rate aliasing/graininess ("rè") when transcoding 44.1kHz AAC/MP3 sources.
+ *    eliminates sample-rate aliasing/graininess when transcoding 44.1kHz AAC/MP3 sources.
  * 2. +3.5 dB (1.5x) clean pre-gain in floating-point domain compensates for YouTube/Spotify
  *    -14 LUFS loudness normalization so tracks sound full and loud at 100% default volume.
  * 3. Lookahead soft brickwall limiter (alimiter at 0.95 / -0.4 dBFS) prevents 16-bit integer
- *    clipping/distortion ("rè") on heavy bass drops or boosted volume.
+ *    clipping/distortion on heavy bass drops or boosted volume.
  */
 export const HIGH_QUALITY_AUDIO_FILTER =
   'aresample=48000:resampler=swr:filter_size=32:phase_shift=10:linear_interp=1,volume=1.5,alimiter=limit=0.95:level=disabled:attack=5:release=50';
 
-/**
- * Validate the extraction target before passing it to yt-dlp.
- * Prevents arbitrary plain-text strings and command-line option injection.
- */
 export function validateExtractionTarget(targetQueryOrUrl, options = {}) {
   if (!targetQueryOrUrl || typeof targetQueryOrUrl !== 'string') {
     throw new InvalidInputError(
@@ -66,19 +64,35 @@ export function validateExtractionTarget(targetQueryOrUrl, options = {}) {
 }
 
 /**
- * Build the yt-dlp argument array prioritizing native 48kHz Opus / highest-bitrate audio.
+ * Build the yt-dlp argument array using universal format fallback ('bestaudio/best'),
+ * Node.js EJS runtime ('--js-runtimes node'), and multi-client resilience.
  *
  * @param {string} validatedTarget
  * @returns {string[]}
  */
 export function buildYtdlpArgs(validatedTarget) {
-  return [
-    '-f', 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best',
+  const args = [
+    '-f', 'bestaudio/best',
     '--no-playlist',
     '--quiet',
-    '-o', '-',
-    validatedTarget
+    '--no-warnings',
+    '--no-check-certificates',
+    '--geo-bypass',
+    '--force-ipv4',
+    '--js-runtimes', 'node',
+    '--extractor-args', 'youtube:player_client=default,android_vr,tv,web_safari,mweb'
   ];
+
+  const envCookiePath = process.env.YTDLP_COOKIES_PATH?.trim();
+  const defaultCookiePath = path.resolve(process.cwd(), 'cookies.txt');
+  if (envCookiePath && fs.existsSync(envCookiePath)) {
+    args.push('--cookies', envCookiePath);
+  } else if (fs.existsSync(defaultCookiePath)) {
+    args.push('--cookies', defaultCookiePath);
+  }
+
+  args.push('-o', '-', validatedTarget);
+  return args;
 }
 
 /**
@@ -120,10 +134,6 @@ function formatBoundedStderr(bufferState) {
   return redactSensitiveString(raw);
 }
 
-/**
- * Terminate a child process safely with SIGTERM and escalate to SIGKILL only
- * if the process has not exited within killTimeoutMs.
- */
 export function terminateProcessSafely(proc, killTimeoutMs = 2000) {
   return new Promise((resolve) => {
     if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
@@ -176,10 +186,6 @@ export function terminateProcessSafely(proc, killTimeoutMs = 2000) {
   });
 }
 
-/**
- * Create a Discord-compatible PCM audio stream and AudioResource backed by
- * yt-dlp -> ffmpeg child processes with full lifecycle and backpressure management.
- */
 export async function createAudioStream(targetQueryOrUrl, options = {}) {
   const validatedTarget = validateExtractionTarget(targetQueryOrUrl, {
     allowHttp: options.allowHttp ?? config.ALLOW_HTTP_MEDIA
@@ -352,7 +358,6 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     return cleanupPromise;
   }
 
-  // 1. Spawn yt-dlp
   try {
     ytdlpProcess = spawnFn(ytdlpPath, ytdlpArgs, {
       shell: false,
@@ -368,7 +373,6 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     });
   }
 
-  // 2. Spawn ffmpeg
   try {
     ffmpegProcess = spawnFn(ffmpegPath, ffmpegArgs, {
       shell: false,
@@ -582,8 +586,6 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     }
   });
 
-  // Use linear setVolume instead of setVolumeLogarithmic so 100% is true 1.0x unity gain
-  // without attenuating quiet tracks or over-clipping 16-bit integer PCM samples.
   if (options.volume !== undefined && resource?.volume) {
     const normalizedVol = Math.max(0, Number(options.volume)) / 100;
     if (typeof resource.volume.setVolume === 'function') {
