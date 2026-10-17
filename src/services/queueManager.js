@@ -8,7 +8,10 @@ import {
   joinVoiceChannel as defaultJoinVoiceChannel,
   entersState as defaultEntersState
 } from '../utils/discordSdk.js';
-import { createAudioStream as defaultCreateAudioStream } from './streamer.js';
+import {
+  createAudioStream as defaultCreateAudioStream,
+  BASSBOOST_PRESETS
+} from './streamer.js';
 import { logger as defaultLogger } from '../utils/logger.js';
 import {
   ErrorCodes,
@@ -22,6 +25,7 @@ import {
 } from '../utils/embeds.js';
 
 export const VALID_LOOP_MODES = Object.freeze(['off', 'track', 'queue']);
+export const VALID_BASSBOOST_LEVELS = Object.freeze(Object.keys(BASSBOOST_PRESETS));
 
 /**
  * Per-guild isolated queue and playback lifecycle manager.
@@ -57,6 +61,7 @@ export class QueueManager {
         state: 'idle',
         loopMode: 'off',
         volume: this.config.DEFAULT_VOLUME ?? 100,
+        filters: { bassboost: 'off', nightcore: false, speed: 1.0 },
         currentTrack: null,
         tracks: [],
         upcomingCount: 0,
@@ -73,6 +78,7 @@ export class QueueManager {
       state: queue.state,
       loopMode: queue.loopMode,
       volume: queue.volume,
+      filters: { ...queue.filters },
       currentTrack: queue.currentTrack ? { ...queue.currentTrack } : null,
       tracks: queue.tracks.map((t) => ({ ...t })),
       upcomingCount: queue.tracks.length,
@@ -126,6 +132,13 @@ export class QueueManager {
       handledSessionIds: new Set(),
       volume: this.config.DEFAULT_VOLUME ?? 100,
       loopMode: 'off',
+      filters: {
+        bassboost: 'off',
+        nightcore: false,
+        speed: 1.0
+      },
+      trackPositionBaseSec: 0,
+      trackStartedAtMs: null,
       idleTimer: null,
       state: 'idle',
       consecutiveFailures: 0,
@@ -144,6 +157,25 @@ export class QueueManager {
     });
 
     return queue;
+  }
+
+  /**
+   * Compute estimated elapsed playback position in seconds for the current track
+   * so mid-song filter toggles (bassboost, nightcore, speed) resume smoothly.
+   */
+  getCurrentTrackElapsedSeconds(queue) {
+    if (!queue || !queue.currentTrack || queue.currentTrack.isLive) {
+      return 0;
+    }
+    let elapsed = queue.trackPositionBaseSec || 0;
+    if (queue.state === 'playing' && queue.trackStartedAtMs) {
+      const rate = (queue.filters?.nightcore ? 1.25 : 1.0) * (queue.filters?.speed || 1.0);
+      elapsed += ((Date.now() - queue.trackStartedAtMs) / 1000) * rate;
+    }
+    if (queue.currentTrack.duration && elapsed >= queue.currentTrack.duration - 2) {
+      return 0;
+    }
+    return Math.max(0, Math.floor(elapsed));
   }
 
   attachPlayerListeners(queue) {
@@ -166,9 +198,15 @@ export class QueueManager {
         queue.state = 'buffering';
       } else if (nextStatus === AudioPlayerStatus.Playing) {
         queue.state = 'playing';
+        queue.trackStartedAtMs = Date.now();
         queue.consecutiveFailures = 0;
         this.clearIdleTimer(queue);
       } else if (nextStatus === AudioPlayerStatus.Paused) {
+        if (queue.trackStartedAtMs) {
+          const rate = (queue.filters?.nightcore ? 1.25 : 1.0) * (queue.filters?.speed || 1.0);
+          queue.trackPositionBaseSec += ((Date.now() - queue.trackStartedAtMs) / 1000) * rate;
+          queue.trackStartedAtMs = null;
+        }
         queue.state = 'paused';
       } else if (nextStatus === AudioPlayerStatus.AutoPaused) {
         queue.state = 'autopaused';
@@ -474,7 +512,7 @@ export class QueueManager {
     };
   }
 
-  async startTrackPlayback(queue, track, { announce = false } = {}) {
+  async startTrackPlayback(queue, track, { announce = false, seekSeconds = 0 } = {}) {
     if (queue.state === 'destroyed' || this.shuttingDown) {
       return;
     }
@@ -493,22 +531,28 @@ export class QueueManager {
     const sessionId = crypto.randomUUID();
     queue.activeSessionId = sessionId;
     queue.currentTrack = track;
+    queue.trackPositionBaseSec = seekSeconds > 0 ? seekSeconds : 0;
+    queue.trackStartedAtMs = Date.now();
     queue.state = 'buffering';
 
-    // Use direct FFmpeg HTTP streaming when the track is a validated direct CDN link or TikWM CDN stream
     const useDirectFfmpeg =
       this.createStreamFn === defaultCreateAudioStream &&
       (track.source === 'direct_media' ||
-        String(track.query || '').includes('tikwm.com/video/media/') ||
         String(track.query || '').includes('cdn.discordapp.com') ||
         String(track.query || '').includes('media.discordapp.net'));
+
+    const hasActiveFilters =
+      queue.filters.bassboost !== 'off' ||
+      queue.filters.nightcore === true ||
+      Math.abs((queue.filters.speed ?? 1.0) - 1.0) >= 0.01;
 
     this.logger.info('Starting track playback', {
       guildId: queue.guildId,
       sessionId,
       title: track.title,
       source: track.source,
-      directFfmpeg: useDirectFfmpeg
+      directFfmpeg: useDirectFfmpeg,
+      seekSeconds
     });
 
     let streamSession;
@@ -516,7 +560,11 @@ export class QueueManager {
       streamSession = await this.createStreamFn(track.query, {
         sessionId,
         volume: queue.volume,
+        source: track.source,
+        webpageUrl: track.webpageUrl,
         directFfmpeg: useDirectFfmpeg,
+         ...(hasActiveFilters ? { filters: { ...queue.filters } } : {}),
+        ...(seekSeconds > 0 ? { seekSeconds } : {}),
         metadata: {
           guildId: queue.guildId,
           sessionId,
@@ -556,6 +604,132 @@ export class QueueManager {
     } catch (err) {
       await this.handleSessionFailure(queue, sessionId, err);
     }
+  }
+
+  /**
+   * Update per-guild Bassboost preset ('off' | 'low' | 'medium' | 'high' | 'extreme')
+   * and hot-reload the active stream at its current playback position.
+   */
+  async setBassboost(guildId, rawLevel = null) {
+    const queue = this.getOrCreateQueue(guildId);
+
+    let nextLevel;
+    if (rawLevel === null || rawLevel === undefined || String(rawLevel).trim() === '') {
+      // Toggle between 'high' and 'off' when invoked without arguments
+      nextLevel = queue.filters.bassboost === 'off' ? 'high' : 'off';
+    } else {
+      const normalized = String(rawLevel).trim().toLowerCase();
+      const numericMap = { '0': 'off', '1': 'low', '2': 'medium', '3': 'high', '4': 'extreme', '5': 'extreme' };
+      nextLevel = numericMap[normalized] || normalized;
+    }
+
+    if (!VALID_BASSBOOST_LEVELS.includes(nextLevel)) {
+      throw new QueueOperationError(
+        `Invalid bassboost level "${rawLevel}". Choose: ${VALID_BASSBOOST_LEVELS.join(', ')}.`,
+        {
+          code: ErrorCodes.INVALID_INPUT,
+          userMessage: 'Invalid bassboost level. Choose `off`, `low`, `medium`, `high`, or `extreme`.'
+        }
+      );
+    }
+
+    queue.filters.bassboost = nextLevel;
+
+    if (queue.currentTrack && (queue.state === 'playing' || queue.state === 'buffering')) {
+      const seekSeconds = this.getCurrentTrackElapsedSeconds(queue);
+      await this.startTrackPlayback(queue, queue.currentTrack, {
+        announce: false,
+        seekSeconds
+      });
+    }
+
+    return {
+      bassboost: queue.filters.bassboost,
+      filters: { ...queue.filters },
+      snapshot: this.getSnapshot(guildId)
+    };
+  }
+
+  /**
+   * Toggle or set Nightcore mode (1.25x pitch + tempo) and hot-reload active playback.
+   */
+  async setNightcore(guildId, enabled = null) {
+    const queue = this.getOrCreateQueue(guildId);
+
+    if (enabled === null || enabled === undefined) {
+      queue.filters.nightcore = !queue.filters.nightcore;
+    } else if (typeof enabled === 'boolean') {
+      queue.filters.nightcore = enabled;
+    } else {
+      const str = String(enabled).trim().toLowerCase();
+      if (['on', 'true', '1', 'enable', 'enabled'].includes(str)) {
+        queue.filters.nightcore = true;
+      } else if (['off', 'false', '0', 'disable', 'disabled'].includes(str)) {
+        queue.filters.nightcore = false;
+      } else {
+        throw new QueueOperationError('Invalid nightcore option. Use `on` or `off`.', {
+          code: ErrorCodes.INVALID_INPUT,
+          userMessage: 'Invalid option. Use `/nightcore` or `!nightcore <on|off>`.'
+        });
+      }
+    }
+
+    if (queue.currentTrack && (queue.state === 'playing' || queue.state === 'buffering')) {
+      const seekSeconds = this.getCurrentTrackElapsedSeconds(queue);
+      await this.startTrackPlayback(queue, queue.currentTrack, {
+        announce: false,
+        seekSeconds
+      });
+    }
+
+    return {
+      nightcore: queue.filters.nightcore,
+      filters: { ...queue.filters },
+      snapshot: this.getSnapshot(guildId)
+    };
+  }
+
+  /**
+   * Set playback speed multiplier (0.5x to 2.0x) and hot-reload active playback.
+   */
+  async setSpeed(guildId, rawSpeed) {
+    const queue = this.getOrCreateQueue(guildId);
+
+    let speedVal = 1.0;
+    if (rawSpeed !== null && rawSpeed !== undefined) {
+      const str = String(rawSpeed).trim().toLowerCase().replace(/x$/, '');
+      if (['off', 'reset', 'normal', 'default'].includes(str)) {
+        speedVal = 1.0;
+      } else {
+        speedVal = Number.parseFloat(str);
+      }
+    }
+
+    if (!Number.isFinite(speedVal) || speedVal < 0.5 || speedVal > 2.0) {
+      throw new QueueOperationError(
+        'Speed must be between 0.5x and 2.0x.',
+        {
+          code: ErrorCodes.INVALID_INPUT,
+          userMessage: 'Please provide a playback speed between `0.5` and `2.0` (e.g. `1.25` or `0.85`).'
+        }
+      );
+    }
+
+    queue.filters.speed = Number(speedVal.toFixed(2));
+
+    if (queue.currentTrack && (queue.state === 'playing' || queue.state === 'buffering')) {
+      const seekSeconds = this.getCurrentTrackElapsedSeconds(queue);
+      await this.startTrackPlayback(queue, queue.currentTrack, {
+        announce: false,
+        seekSeconds
+      });
+    }
+
+    return {
+      speed: queue.filters.speed,
+      filters: { ...queue.filters },
+      snapshot: this.getSnapshot(guildId)
+    };
   }
 
   async handleNaturalTrackCompletion(queue, sessionId) {
@@ -802,6 +976,7 @@ export class QueueManager {
     queue.currentTrack = null;
     queue.activeSessionId = null;
     queue.loopMode = 'off';
+    queue.filters = { bassboost: 'off', nightcore: false, speed: 1.0 };
     queue.consecutiveFailures = 0;
 
     const prevSession = queue.currentSession;

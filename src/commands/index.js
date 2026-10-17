@@ -34,6 +34,9 @@ import stopCommand from './stop.js';
 import queueCommand from './queue.js';
 import volumeCommand from './volume.js';
 import loopCommand from './loop.js';
+import bassboostCommand from './bassboost.js';
+import nightcoreCommand from './nightcore.js';
+import speedCommand from './speed.js';
 import nowplayingCommand from './nowplaying.js';
 import helpCommand from './help.js';
 
@@ -46,6 +49,9 @@ export const ALL_COMMAND_MODULES = Object.freeze([
   queueCommand,
   volumeCommand,
   loopCommand,
+  bassboostCommand,
+  nightcoreCommand,
+  speedCommand,
   nowplayingCommand,
   helpCommand
 ]);

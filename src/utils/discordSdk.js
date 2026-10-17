@@ -172,6 +172,12 @@ class FallbackSlashCommandBuilder {
     this.options.push(opt);
     return this;
   }
+  addNumberOption(fn) {
+    const opt = new OptionBuilderBase(10);
+    fn(opt);
+    this.options.push(opt);
+    return this;
+  }
   toJSON() {
     if (!this.name || !this.description) {
       throw new Error('SlashCommandBuilder requires both name and description before serialization.');
@@ -391,6 +397,7 @@ const FallbackMessageFlags = Object.freeze({
 const FallbackAudioPlayerStatus = Object.freeze({
   Idle: 'idle',
   Buffering: 'buffering',
+  Unknown: 'unknown',
   Playing: 'playing',
   Paused: 'paused',
   AutoPaused: 'autopaused'

@@ -8,7 +8,8 @@ import {
   buildYtdlpArgs,
   buildFfmpegArgs,
   validateExtractionTarget,
-  HIGH_QUALITY_AUDIO_FILTER
+  HIGH_QUALITY_AUDIO_FILTER,
+  buildAudioFilterChain
 } from '../src/services/streamer.js';
 import { ErrorCodes, InvalidInputError, StreamExtractionError } from '../src/utils/errors.js';
 import { StreamType } from '../src/utils/discordSdk.js';
@@ -68,6 +69,7 @@ test('Streamer — builds high-quality yt-dlp and ffmpeg arguments and rejects u
     '32768',
     '-loglevel',
     '0',
+    '-vn',
     '-af',
     HIGH_QUALITY_AUDIO_FILTER,
     '-f',
@@ -333,4 +335,18 @@ test('Streamer — real system ffmpeg transcoding pipeline outputs 48kHz stereo 
   const info = await completedPromise;
   assert.ok(info.pcmBytes > 0, 'Expected real ffmpeg process to emit PCM bytes');
   assert.equal(session.getState().status, 'completed');
+});
+
+test('Streamer — buildAudioFilterChain composes bassboost, nightcore, and speed filters cleanly', () => {
+  const defaultFilter = buildAudioFilterChain({});
+  assert.equal(defaultFilter, HIGH_QUALITY_AUDIO_FILTER);
+
+  const bassHigh = buildAudioFilterChain({ bassboost: 'high' });
+  assert.ok(bassHigh.includes('bass=g=13'));
+  assert.ok(bassHigh.includes('alimiter=limit=0.95'));
+
+  const nightcoreAndSpeed = buildAudioFilterChain({ bassboost: 'medium', nightcore: true, speed: 1.2 });
+  assert.ok(nightcoreAndSpeed.includes('bass=g=9'));
+  assert.ok(nightcoreAndSpeed.includes('asetrate=48000*1.25'));
+  assert.ok(nightcoreAndSpeed.includes('atempo=1.2'));
 });

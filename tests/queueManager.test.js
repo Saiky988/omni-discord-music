@@ -332,3 +332,26 @@ test('QueueManager — voice connection recovery succeeds on transient disconnec
   assert.equal(queueManager.getQueue('guild-vc'), null);
   assert.ok(notifications.length >= 1);
 });
+
+test('QueueManager — live bassboost, nightcore, and speed filters hot-reload active playback', async () => {
+  const { queueManager, createdSessions } = createHarness();
+
+  await queueManager.enqueue('guild-fx', [createTrack('1')], {
+    voiceChannelId: 'vc-fx'
+  });
+  assert.equal(createdSessions.length, 1);
+
+  const bbRes = await queueManager.setBassboost('guild-fx', 'high');
+  assert.equal(bbRes.bassboost, 'high');
+  assert.equal(createdSessions.length, 2);
+
+  const ncRes = await queueManager.setNightcore('guild-fx', 'on');
+  assert.equal(ncRes.nightcore, true);
+  assert.equal(createdSessions.length, 3);
+
+  const spRes = await queueManager.setSpeed('guild-fx', 1.35);
+  assert.equal(spRes.speed, 1.35);
+  assert.equal(createdSessions.length, 4);
+
+  await queueManager.shutdownAll();
+});

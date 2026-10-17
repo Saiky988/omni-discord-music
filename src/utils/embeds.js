@@ -38,6 +38,14 @@ const LOOP_LABELS = Object.freeze({
   queue: 'Queue'
 });
 
+const BASSBOOST_LABELS = Object.freeze({
+  off: 'Off',
+  low: 'Low (+5dB)',
+  medium: 'Medium (+9dB)',
+  high: 'High (+13dB)',
+  extreme: 'Extreme (+17dB)'
+});
+
 /**
  * Sanitize user-controlled text so it cannot trigger @everyone/@here mentions,
  * break markdown links, or create runaway formatting blocks, without leaving
@@ -97,6 +105,10 @@ export function formatSourceLabel(source) {
 
 export function formatLoopMode(loopMode) {
   return LOOP_LABELS[loopMode] || 'Off';
+}
+
+export function formatBassboostLabel(level) {
+  return BASSBOOST_LABELS[level] || 'Off';
 }
 
 function applySafeThumbnail(embed, thumbnailUrl) {
@@ -180,6 +192,18 @@ export function buildNowPlayingEmbed(track, queueState = {}) {
   pills.push(`\`${duration}\``);
   if (queueState.loopMode && queueState.loopMode !== 'off') {
     pills.push(`\`Loop: ${formatLoopMode(queueState.loopMode)}\``);
+  }
+  const filters = queueState.filters;
+  if (filters) {
+    if (filters.bassboost && filters.bassboost !== 'off') {
+      pills.push(`\`Bass: ${filters.bassboost.toUpperCase()}\``);
+    }
+    if (filters.nightcore) {
+      pills.push('`Nightcore`');
+    }
+    if (Number.isFinite(filters.speed) && Math.abs(filters.speed - 1.0) >= 0.01) {
+      pills.push(`\`Speed: ${filters.speed}x\``);
+    }
   }
   if (queueState.upcomingCount > 0) {
     pills.push(`\`+${queueState.upcomingCount} in queue\``);
@@ -341,6 +365,24 @@ export function buildLoopEmbed(loopMode) {
   return new EmbedBuilder()
     .setColor(EmbedColors.INFO)
     .setDescription(`**Loop Mode:** \`${formatLoopMode(loopMode)}\``);
+}
+
+export function buildBassboostEmbed(level) {
+  return new EmbedBuilder()
+    .setColor(level === 'off' ? EmbedColors.INFO : EmbedColors.SUCCESS)
+    .setDescription(`**Bassboost:** \`${formatBassboostLabel(level)}\``);
+}
+
+export function buildNightcoreEmbed(enabled) {
+  return new EmbedBuilder()
+    .setColor(enabled ? EmbedColors.SUCCESS : EmbedColors.INFO)
+    .setDescription(`**Nightcore:** \`${enabled ? 'On (1.25x Pitch + Tempo)' : 'Off'}\``);
+}
+
+export function buildSpeedEmbed(speed) {
+  return new EmbedBuilder()
+    .setColor(Math.abs(speed - 1.0) < 0.01 ? EmbedColors.INFO : EmbedColors.SUCCESS)
+    .setDescription(`**Playback Speed:** \`${speed}x\``);
 }
 
 export function buildErrorEmbed(title, message) {

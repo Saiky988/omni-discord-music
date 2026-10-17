@@ -997,18 +997,20 @@ export class SourceResolver {
         return null;
       }
 
-      // Prefer clean .mp4/audio URL or direct stream URL
+      // Prefer signed CDN play/music stream URL over /video/media/play/ fallback
       const streamCandidate =
-        (data.id ? `https://www.tikwm.com/video/media/play/${data.id}.mp4` : null) ||
         data.play ||
+        data.wmplay ||
+        data.music_info?.play ||
         data.music ||
-        data.music_info?.play;
+        (data.id ? `https://www.tikwm.com/video/media/play/${data.id}.mp4` : null);
 
       if (!streamCandidate || typeof streamCandidate !== 'string') {
         return null;
       }
 
-      const safeStreamUrl = parseAndValidateUrl(streamCandidate, {
+      const resolvedCandidate = new URL(streamCandidate, 'https://www.tikwm.com').toString();
+      const safeStreamUrl = parseAndValidateUrl(resolvedCandidate, {
         allowHttp: Boolean(this.config.ALLOW_HTTP_MEDIA)
       }).toString();
 
@@ -1021,12 +1023,22 @@ export class SourceResolver {
 
       this.assertDurationAllowed(duration, false);
 
+      const rawThumb = data.cover || data.origin_cover || data.author?.avatar || null;
+      let thumbnail = null;
+      if (rawThumb && typeof rawThumb === 'string') {
+        try {
+          thumbnail = new URL(rawThumb, 'https://www.tikwm.com').toString();
+        } catch {
+          thumbnail = null;
+        }
+      }
+
       return {
         title: data.title || data.music_info?.title || 'TikTok Audio',
         artist: data.author?.nickname || data.author?.unique_id || data.music_info?.author || null,
         query: safeStreamUrl,
         source: 'tiktok',
-        thumbnail: data.cover || data.origin_cover || data.author?.avatar || null,
+        thumbnail,
         duration,
         webpageUrl: tiktokUrl,
         isLive: false

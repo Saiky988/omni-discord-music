@@ -46,6 +46,11 @@ export async function execute(context) {
         name: '`/volume <0-200>` / `/loop <off|track|queue>`',
         value: `Adjust server volume or set loop mode (\`${prefix}volume 100\`, \`${prefix}loop track\`).`,
         inline: true
+      },
+      {
+        name: '`/bassboost [level]` / `/nightcore` / `/speed <0.5-2.0>`',
+        value: `Live audio filters: bassboost (\`${prefix}bb high\`), nightcore (\`${prefix}nc\`), and speed (\`${prefix}speed 1.25\`).`,
+        inline: false
       }
     )
     .setTimestamp();

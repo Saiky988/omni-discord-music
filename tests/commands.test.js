@@ -13,7 +13,7 @@ import { redactSensitiveString } from '../src/utils/logger.js';
 test('Commands — all required and additional command modules load and serialize cleanly', () => {
   const { commands, aliases } = loadCommands(ALL_COMMAND_MODULES);
 
-  const requiredNames = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'volume', 'loop', 'nowplaying', 'help'];
+  const requiredNames = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'volume', 'loop', 'bassboost', 'nightcore', 'speed', 'nowplaying', 'help'];
   for (const name of requiredNames) {
     assert.ok(commands.has(name), `Expected command "${name}" to be registered`);
   }
@@ -22,6 +22,9 @@ test('Commands — all required and additional command modules load and serializ
   assert.equal(aliases.get('s'), 'skip');
   assert.equal(aliases.get('q'), 'queue');
   assert.equal(aliases.get('np'), 'nowplaying');
+  assert.equal(aliases.get('bb'), 'bassboost');
+  assert.equal(aliases.get('nc'), 'nightcore');
+  assert.equal(aliases.get('tempo'), 'speed');
 
   const serialized = getSerializedSlashCommands();
   assert.equal(serialized.length, requiredNames.length);
