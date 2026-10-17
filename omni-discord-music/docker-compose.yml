@@ -1,0 +1,42 @@
+# ============================================================================
+# Docker Compose Deployment — omni-discord-music
+#
+# Prerequisites:
+# 1. Copy .env.example to .env and fill in DISCORD_TOKEN and DISCORD_CLIENT_ID.
+# 2. Deploy slash commands once:
+#      docker compose run --rm omni-music npm run deploy-commands
+# 3. Start the bot in the background:
+#      docker compose up -d --build
+#
+# NOTE: Do NOT run both Docker Compose and host PM2 simultaneously with the same
+# DISCORD_TOKEN, as running two instances causes duplicate voice/command state.
+# ============================================================================
+
+services:
+  omni-music:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: omni-discord-music
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      YTDLP_PATH: /usr/local/bin/yt-dlp
+      FFMPEG_PATH: /usr/bin/ffmpeg
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
