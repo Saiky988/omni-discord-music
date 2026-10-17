@@ -7,14 +7,12 @@ import {
   createAudioStream,
   buildYtdlpArgs,
   buildFfmpegArgs,
-  validateExtractionTarget
+  validateExtractionTarget,
+  HIGH_QUALITY_AUDIO_FILTER
 } from '../src/services/streamer.js';
 import { ErrorCodes, InvalidInputError, StreamExtractionError } from '../src/utils/errors.js';
 import { StreamType } from '../src/utils/discordSdk.js';
 
-/**
- * Create a controllable mock child process with stdin, stdout, stderr, and kill().
- */
 function createMockChildProcess({ autoCloseOnKill = true } = {}) {
   const proc = new EventEmitter();
   proc.stdin = new PassThrough();
@@ -41,11 +39,11 @@ function createMockChildProcess({ autoCloseOnKill = true } = {}) {
   return proc;
 }
 
-test('Streamer — builds exact baseline yt-dlp and ffmpeg arguments and rejects unsafe targets', () => {
+test('Streamer — builds high-quality yt-dlp and ffmpeg arguments and rejects unsafe targets', () => {
   const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   assert.deepEqual(buildYtdlpArgs(url), [
     '-f',
-    'bestaudio/best',
+    'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best',
     '--no-playlist',
     '--quiet',
     '-o',
@@ -58,8 +56,12 @@ test('Streamer — builds exact baseline yt-dlp and ffmpeg arguments and rejects
     'pipe:0',
     '-analyzeduration',
     '0',
+    '-probesize',
+    '32768',
     '-loglevel',
     '0',
+    '-af',
+    HIGH_QUALITY_AUDIO_FILTER,
     '-f',
     's16le',
     '-ar',
@@ -278,8 +280,6 @@ test('Streamer — explicit cancellation and idempotent cleanup escalate to SIGK
 });
 
 test('Streamer — real system ffmpeg transcoding pipeline outputs 48kHz stereo s16le PCM', async () => {
-  // Generate a minimal valid 44-byte WAV header + 1600 bytes of PCM in a mock yt-dlp stdout,
-  // and pipe it into the REAL /usr/bin/ffmpeg binary to verify s16le 48kHz stereo output.
   const ytdlpProc = createMockChildProcess();
   let callIndex = 0;
 
@@ -301,20 +301,19 @@ test('Streamer — real system ffmpeg transcoding pipeline outputs 48kHz stereo 
     session.events.once('failed', reject);
   });
 
-  // Construct a valid 16-bit mono 8000Hz WAV buffer (44-byte header + 1600 bytes data = 0.1s)
   const dataSize = 1600;
   const wav = Buffer.alloc(44 + dataSize);
   wav.write('RIFF', 0);
   wav.writeUInt32LE(36 + dataSize, 4);
   wav.write('WAVE', 8);
   wav.write('fmt ', 12);
-  wav.writeUInt32LE(16, 16); // Subchunk1Size (PCM)
-  wav.writeUInt16LE(1, 20);  // AudioFormat (1 = PCM)
-  wav.writeUInt16LE(1, 22);  // NumChannels (1)
-  wav.writeUInt32LE(8000, 24); // SampleRate (8000 Hz)
-  wav.writeUInt32LE(16000, 28); // ByteRate
-  wav.writeUInt16LE(2, 32);  // BlockAlign
-  wav.writeUInt16LE(16, 34); // BitsPerSample
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(8000, 24);
+  wav.writeUInt32LE(16000, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
   wav.write('data', 36);
   wav.writeUInt32LE(dataSize, 40);
 
@@ -324,7 +323,6 @@ test('Streamer — real system ffmpeg transcoding pipeline outputs 48kHz stereo 
   ytdlpProc.emit('close', 0, null);
 
   const info = await completedPromise;
-  // 0.1s of 48kHz stereo 16-bit PCM = 48000 * 0.1 * 2 channels * 2 bytes = 19200 bytes
   assert.ok(info.pcmBytes > 0, 'Expected real ffmpeg process to emit PCM bytes');
   assert.equal(session.getState().status, 'completed');
 });

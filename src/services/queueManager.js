@@ -17,7 +17,8 @@ import {
 import {
   buildNowPlayingEmbed,
   buildExtractionFailureEmbed,
-  buildConnectionRecoveryFailureEmbed
+  buildConnectionRecoveryFailureEmbed,
+  buildPlayerControlRow
 } from '../utils/embeds.js';
 
 export const VALID_LOOP_MODES = Object.freeze(['off', 'track', 'queue']);
@@ -55,7 +56,7 @@ export class QueueManager {
         textChannelId: null,
         state: 'idle',
         loopMode: 'off',
-        volume: this.config.DEFAULT_VOLUME,
+        volume: this.config.DEFAULT_VOLUME ?? 100,
         currentTrack: null,
         tracks: [],
         upcomingCount: 0,
@@ -123,7 +124,7 @@ export class QueueManager {
       currentSession: null,
       activeSessionId: null,
       handledSessionIds: new Set(),
-      volume: this.config.DEFAULT_VOLUME ?? 80,
+      volume: this.config.DEFAULT_VOLUME ?? 100,
       loopMode: 'off',
       idleTimer: null,
       state: 'idle',
@@ -254,7 +255,8 @@ export class QueueManager {
       guildId: queue.guildId,
       adapterCreator: adapterCreator || (() => ({ sendPayload: () => true, destroy: () => {} })),
       selfDeaf: true,
-      selfMute: false
+      selfMute: false,
+      debug: this.config.LOG_LEVEL === 'debug'
     });
 
     queue.connection = connection;
@@ -270,12 +272,22 @@ export class QueueManager {
       queue.reconnectAttempts = 0;
       return connection;
     } catch (err) {
+      const lastState = connection.state?.status || 'unknown';
+      const networkingCode = connection.state?.networking?.state?.code ?? null;
+      this.logger.error('VoiceConnection failed to reach Ready state before timeout', {
+        guildId: queue.guildId,
+        voiceChannelId,
+        lastVoiceState: lastState,
+        networkingStateCode: networkingCode,
+        timeoutMs: this.config.VOICE_READY_TIMEOUT_MS,
+        hint: 'Ensure @discordjs/voice >= 0.19.0 and @snazzah/davey are installed on Node.js 22.12+ for Discord DAVE E2EE voice handshakes, and outbound UDP is open.'
+      });
       await this.destroyGuildQueue(queue.guildId, 'voice_connect_timeout');
       throw new QueueOperationError(
-        `Voice connection failed to reach Ready state within ${this.config.VOICE_READY_TIMEOUT_MS}ms: ${err.message}`,
+        `Voice connection failed to reach Ready state within ${this.config.VOICE_READY_TIMEOUT_MS}ms (stuck in "${lastState}", networking=${networkingCode}): ${err.message}`,
         {
           code: ErrorCodes.VOICE_RECOVERY_FAILED,
-          userMessage: 'Could not establish a voice connection in that channel. Please check my permissions and try again.',
+          userMessage: 'Could not establish a voice connection in that channel. Please check my permissions and server voice dependencies.',
           cause: err
         }
       );
@@ -284,6 +296,13 @@ export class QueueManager {
 
   attachConnectionListeners(queue, connection) {
     const { guildId } = queue;
+
+    connection.on('debug', (msg) => {
+      this.logger.debug('VoiceConnection protocol debug', {
+        guildId,
+        detail: msg
+      });
+    });
 
     connection.on('stateChange', async (oldState, newState) => {
       if (queue.state === 'destroyed' || queue.connection !== connection) {
@@ -518,13 +537,10 @@ export class QueueManager {
       queue.player.play(streamSession.resource);
       queue.state = 'playing';
       if (announce) {
+        const snap = this.getSnapshot(queue.guildId);
         await this.notifyGuildChannel(queue, {
-          embeds: [
-            buildNowPlayingEmbed(track, {
-              loopMode: queue.loopMode,
-              volume: queue.volume
-            })
-          ]
+          embeds: [buildNowPlayingEmbed(track, snap)],
+          components: [buildPlayerControlRow(snap)]
         });
       }
     } catch (err) {
@@ -828,10 +844,10 @@ export class QueueManager {
       }
 
       const ratio = parsed / 100;
-      if (typeof activeResource.volume.setVolumeLogarithmic === 'function') {
-        activeResource.volume.setVolumeLogarithmic(ratio);
-      } else if (typeof activeResource.volume.setVolume === 'function') {
+      if (typeof activeResource.volume.setVolume === 'function') {
         activeResource.volume.setVolume(ratio);
+      } else if (typeof activeResource.volume.setVolumeLogarithmic === 'function') {
+        activeResource.volume.setVolumeLogarithmic(ratio);
       }
     }
 

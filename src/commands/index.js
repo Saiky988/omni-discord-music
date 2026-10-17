@@ -15,10 +15,15 @@ import {
   UnsupportedMediaError
 } from '../utils/errors.js';
 import {
+  buildNowPlayingEmbed,
+  buildSkippedEmbed,
+  buildStoppedEmbed,
+  buildQueueEmbed,
   buildErrorEmbed,
   buildNoPermissionEmbed,
   buildInvalidInputEmbed,
-  buildUnsupportedSourceEmbed
+  buildUnsupportedSourceEmbed,
+  buildPlayerControlRow
 } from '../utils/embeds.js';
 
 import playCommand from './play.js';
@@ -45,11 +50,6 @@ export const ALL_COMMAND_MODULES = Object.freeze([
   helpCommand
 ]);
 
-/**
- * Validate a command module's structure and serialize its SlashCommandBuilder definition.
- *
- * @param {object} mod
- */
 export function validateCommandModule(mod) {
   if (!mod || typeof mod !== 'object') {
     throw new Error('Command module must be an object.');
@@ -69,9 +69,6 @@ export function validateCommandModule(mod) {
   return serialized;
 }
 
-/**
- * Load and validate all command modules into a primary Map and an alias lookup Map.
- */
 export function loadCommands(modules = ALL_COMMAND_MODULES) {
   const commands = new Collection();
   const aliases = new Collection();
@@ -99,18 +96,16 @@ export function loadCommands(modules = ALL_COMMAND_MODULES) {
   return { commands, aliases };
 }
 
-/**
- * Serialize all registered slash command definitions for deployment to the Discord API.
- */
 export function getSerializedSlashCommands(modules = ALL_COMMAND_MODULES) {
   return modules.map((mod) => validateCommandModule(mod));
 }
 
-/**
- * Map an application error into a user-safe Discord Embed response without leaking stack traces.
- */
 export function mapErrorToEmbedResponse(err) {
-  if (err instanceof InvalidInputError || err?.code === ErrorCodes.INVALID_INPUT || err?.code === ErrorCodes.VOLUME_OUT_OF_RANGE) {
+  if (
+    err instanceof InvalidInputError ||
+    err?.code === ErrorCodes.INVALID_INPUT ||
+    err?.code === ErrorCodes.VOLUME_OUT_OF_RANGE
+  ) {
     return {
       isError: true,
       embeds: [buildInvalidInputEmbed(err.userMessage || err.message)]
@@ -149,9 +144,6 @@ export function mapErrorToEmbedResponse(err) {
   };
 }
 
-/**
- * Check guild context, member voice channel state, and bot permissions before executing a command.
- */
 export function verifyVoiceAndPermissions({
   command,
   guild,
@@ -201,7 +193,6 @@ export function verifyVoiceAndPermissions({
     };
   }
 
-  // Verify bot Connect and Speak permissions if permissionsFor is available on the channel
   const botMember = guild.members?.me;
   if (botMember && typeof voiceChannel.permissionsFor === 'function') {
     const perms = voiceChannel.permissionsFor(botMember);
@@ -228,7 +219,7 @@ export function verifyVoiceAndPermissions({
 }
 
 /**
- * Create a unified command dispatcher handling both slash interactions and prefix messages.
+ * Create a unified command dispatcher handling slash interactions, button interactions, and prefix messages.
  */
 export function createCommandHandler(options = {}) {
   const { commands, aliases } = loadCommands(options.modules || ALL_COMMAND_MODULES);
@@ -244,9 +235,126 @@ export function createCommandHandler(options = {}) {
   }
 
   /**
+   * Handle interactive player control buttons (Pause/Resume, Skip, Loop, Queue, Stop).
+   */
+  async function handleButtonInteraction(interaction) {
+    if (!interaction || typeof interaction.customId !== 'string' || !interaction.customId.startsWith('music:')) {
+      return null;
+    }
+
+    const action = interaction.customId.slice('music:'.length);
+    const guild = interaction.guild;
+    const member = interaction.member;
+    const voiceChannel = member?.voice?.channel || null;
+
+    if (!guild) {
+      return null;
+    }
+
+    // Viewing the queue does not require being in voice
+    if (action === 'queue') {
+      const snap = queueManager.getSnapshot(guild.id);
+      await interaction.reply?.({
+        embeds: [buildQueueEmbed(snap, 1, 10)],
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    // Mutating actions require the user to be in the same voice channel as the bot
+    const check = verifyVoiceAndPermissions({
+      command: { requiresVoice: true, requiresSameVoice: true },
+      guild,
+      member,
+      voiceChannel,
+      queueManager
+    });
+
+    if (!check.ok) {
+      await interaction.reply?.({
+        embeds: check.response.embeds,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    try {
+      if (action === 'toggle_pause') {
+        const snap = queueManager.getSnapshot(guild.id);
+        const updated =
+          snap.state === 'paused' || snap.state === 'autopaused'
+            ? queueManager.resume(guild.id)
+            : queueManager.pause(guild.id);
+
+        if (typeof interaction.update === 'function' && updated.snapshot.currentTrack) {
+          await interaction.update({
+            embeds: [buildNowPlayingEmbed(updated.snapshot.currentTrack, updated.snapshot)],
+            components: [buildPlayerControlRow(updated.snapshot)]
+          });
+        }
+        return;
+      }
+
+      if (action === 'cycle_loop') {
+        const snap = queueManager.getSnapshot(guild.id);
+        const order = ['off', 'track', 'queue'];
+        const nextMode = order[(order.indexOf(snap.loopMode) + 1) % order.length];
+        const updated = queueManager.setLoopMode(guild.id, nextMode);
+
+        if (typeof interaction.update === 'function' && updated.snapshot.currentTrack) {
+          await interaction.update({
+            embeds: [buildNowPlayingEmbed(updated.snapshot.currentTrack, updated.snapshot)],
+            components: [buildPlayerControlRow(updated.snapshot)]
+          });
+        }
+        return;
+      }
+
+      if (action === 'skip') {
+        const result = await queueManager.skip(guild.id);
+        if (result.nextTrack && typeof interaction.update === 'function') {
+          await interaction.update({
+            embeds: [buildNowPlayingEmbed(result.nextTrack, result.snapshot)],
+            components: [buildPlayerControlRow(result.snapshot)]
+          });
+        } else if (typeof interaction.update === 'function') {
+          await interaction.update({
+            embeds: [buildSkippedEmbed(result.skippedTrack, null)],
+            components: []
+          });
+        }
+        return;
+      }
+
+      if (action === 'stop') {
+        const result = await queueManager.stop(guild.id);
+        if (typeof interaction.update === 'function') {
+          await interaction.update({
+            embeds: [buildStoppedEmbed(result.clearedCount)],
+            components: []
+          });
+        }
+        return;
+      }
+    } catch (err) {
+      const mapped = mapErrorToEmbedResponse(err);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply?.({
+          embeds: mapped.embeds,
+          flags: MessageFlags.Ephemeral
+        });
+      }
+    }
+  }
+
+  /**
    * Handle a Discord ChatInputCommandInteraction.
    */
   async function handleSlashInteraction(interaction) {
+    if (interaction && typeof interaction.isButton === 'function' && interaction.isButton()) {
+      return handleButtonInteraction(interaction);
+    }
+
     if (!interaction || (typeof interaction.isChatInputCommand === 'function' && !interaction.isChatInputCommand())) {
       return null;
     }
@@ -334,12 +442,17 @@ export function createCommandHandler(options = {}) {
       response = mapErrorToEmbedResponse(err);
     }
 
+    const payload = {
+      embeds: response.embeds,
+      ...(response.components ? { components: response.components } : {})
+    };
+
     try {
       if (deferred || interaction.deferred) {
-        await interaction.editReply({ embeds: response.embeds });
+        await interaction.editReply(payload);
       } else if (!interaction.replied) {
         await interaction.reply({
-          embeds: response.embeds,
+          ...payload,
           ...(response.isError ? { flags: MessageFlags.Ephemeral } : {})
         });
       }
@@ -437,7 +550,10 @@ export function createCommandHandler(options = {}) {
     }
 
     try {
-      await message.reply?.({ embeds: response.embeds });
+      await message.reply?.({
+        embeds: response.embeds,
+        ...(response.components ? { components: response.components } : {})
+      });
     } catch (err) {
       log.warn('Failed to send prefix command reply', {
         guildId: guild.id,
@@ -454,6 +570,7 @@ export function createCommandHandler(options = {}) {
     aliases,
     resolveCommand,
     handleSlashInteraction,
+    handleButtonInteraction,
     handlePrefixMessage
   };
 }

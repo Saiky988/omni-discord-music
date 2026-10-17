@@ -1,5 +1,9 @@
 import { SlashCommandBuilder } from '../utils/discordSdk.js';
-import { buildNowPlayingEmbed, buildErrorEmbed } from '../utils/embeds.js';
+import {
+  buildNowPlayingEmbed,
+  buildErrorEmbed,
+  buildPlayerControlRow
+} from '../utils/embeds.js';
 
 export const data = new SlashCommandBuilder()
   .setName('nowplaying')
@@ -23,7 +27,8 @@ export async function execute(context) {
   }
 
   return {
-    embeds: [buildNowPlayingEmbed(snapshot.currentTrack, snapshot)]
+    embeds: [buildNowPlayingEmbed(snapshot.currentTrack, snapshot)],
+    components: [buildPlayerControlRow(snapshot)]
   };
 }
 

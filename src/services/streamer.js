@@ -16,13 +16,20 @@ const MAX_STDERR_BYTES = 4096;
 const DOCUMENTED_SEARCH_TARGET_PATTERN = /^(ytsearch1|scsearch1):[^\0\r\n]{2,500}$/;
 
 /**
+ * High-precision real-time audio mastering filter for Discord 48kHz stereo PCM:
+ * 1. Polyphase Sinc resampler (swr, filter_size=32, linear_interp=1) to 48kHz in float domain
+ *    eliminates sample-rate aliasing/graininess ("rè") when transcoding 44.1kHz AAC/MP3 sources.
+ * 2. +3.5 dB (1.5x) clean pre-gain in floating-point domain compensates for YouTube/Spotify
+ *    -14 LUFS loudness normalization so tracks sound full and loud at 100% default volume.
+ * 3. Lookahead soft brickwall limiter (alimiter at 0.95 / -0.4 dBFS) prevents 16-bit integer
+ *    clipping/distortion ("rè") on heavy bass drops or boosted volume.
+ */
+export const HIGH_QUALITY_AUDIO_FILTER =
+  'aresample=48000:resampler=swr:filter_size=32:phase_shift=10:linear_interp=1,volume=1.5,alimiter=limit=0.95:level=disabled:attack=5:release=50';
+
+/**
  * Validate the extraction target before passing it to yt-dlp.
  * Prevents arbitrary plain-text strings and command-line option injection.
- *
- * @param {string} targetQueryOrUrl
- * @param {object} [options]
- * @param {boolean} [options.allowHttp=false]
- * @returns {string}
  */
 export function validateExtractionTarget(targetQueryOrUrl, options = {}) {
   if (!targetQueryOrUrl || typeof targetQueryOrUrl !== 'string') {
@@ -40,7 +47,6 @@ export function validateExtractionTarget(targetQueryOrUrl, options = {}) {
     );
   }
 
-  // Strictly block option injection (arguments starting with '-')
   if (trimmed.startsWith('-')) {
     throw new InvalidInputError(
       'Stream target cannot begin with a hyphen (-).',
@@ -52,7 +58,6 @@ export function validateExtractionTarget(targetQueryOrUrl, options = {}) {
     return trimmed;
   }
 
-  // Must be a validated URL (SSRF and protocol checked)
   const parsed = parseAndValidateUrl(trimmed, {
     allowHttp: Boolean(options.allowHttp ?? config.ALLOW_HTTP_MEDIA)
   });
@@ -61,14 +66,14 @@ export function validateExtractionTarget(targetQueryOrUrl, options = {}) {
 }
 
 /**
- * Build the baseline yt-dlp argument array required by Section 5.1.
+ * Build the yt-dlp argument array prioritizing native 48kHz Opus / highest-bitrate audio.
  *
  * @param {string} validatedTarget
  * @returns {string[]}
  */
 export function buildYtdlpArgs(validatedTarget) {
   return [
-    '-f', 'bestaudio/best',
+    '-f', 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best',
     '--no-playlist',
     '--quiet',
     '-o', '-',
@@ -77,7 +82,8 @@ export function buildYtdlpArgs(validatedTarget) {
 }
 
 /**
- * Build the baseline FFmpeg PCM output argument array required by Section 5.1.
+ * Build the FFmpeg PCM output argument array with high-precision resampling,
+ * clean floating-point gain boost, and brickwall anti-clipping limiter.
  * Produces signed 16-bit little-endian PCM, 48 kHz, stereo.
  *
  * @returns {string[]}
@@ -86,7 +92,9 @@ export function buildFfmpegArgs() {
   return [
     '-i', 'pipe:0',
     '-analyzeduration', '0',
+    '-probesize', '32768',
     '-loglevel', '0',
+    '-af', HIGH_QUALITY_AUDIO_FILTER,
     '-f', 's16le',
     '-ar', '48000',
     '-ac', '2',
@@ -94,9 +102,6 @@ export function buildFfmpegArgs() {
   ];
 }
 
-/**
- * Append chunk to a bounded stderr diagnostic buffer while redacting secrets.
- */
 function appendBoundedStderr(bufferState, chunk) {
   if (bufferState.bytes >= MAX_STDERR_BYTES) {
     return;
@@ -118,10 +123,6 @@ function formatBoundedStderr(bufferState) {
 /**
  * Terminate a child process safely with SIGTERM and escalate to SIGKILL only
  * if the process has not exited within killTimeoutMs.
- *
- * @param {import('node:child_process').ChildProcess | null} proc
- * @param {number} killTimeoutMs
- * @returns {Promise<void>}
  */
 export function terminateProcessSafely(proc, killTimeoutMs = 2000) {
   return new Promise((resolve) => {
@@ -178,19 +179,6 @@ export function terminateProcessSafely(proc, killTimeoutMs = 2000) {
 /**
  * Create a Discord-compatible PCM audio stream and AudioResource backed by
  * yt-dlp -> ffmpeg child processes with full lifecycle and backpressure management.
- *
- * @param {string} targetQueryOrUrl Validated URL or documented extractor search target
- * @param {object} [options]
- * @param {string} [options.sessionId] Optional caller-provided playback session ID
- * @param {number} [options.volume] Initial volume percentage (0..MAX_VOLUME)
- * @param {object} [options.metadata] Metadata to attach to the AudioResource
- * @param {Function} [options.spawnFn] Injectable child_process.spawn for unit testing
- * @param {Function} [options.createResourceFn] Injectable createAudioResource
- * @param {string} [options.ytdlpPath] Path to yt-dlp binary
- * @param {string} [options.ffmpegPath] Path to ffmpeg binary
- * @param {number} [options.killTimeoutMs] Timeout before escalating SIGTERM to SIGKILL
- * @param {boolean} [options.allowHttp] Allow http: URLs when configured
- * @param {object} [options.logger] Logger instance
  */
 export async function createAudioStream(targetQueryOrUrl, options = {}) {
   const validatedTarget = validateExtractionTarget(targetQueryOrUrl, {
@@ -214,9 +202,9 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
 
   let ytdlpProcess = null;
   let ffmpegProcess = null;
-  const pcmStream = new PassThrough({ highWaterMark: 64 * 1024 });
+  const pcmStream = new PassThrough({ highWaterMark: 128 * 1024 });
 
-  let status = 'starting'; // 'starting' | 'streaming' | 'completed' | 'cancelled' | 'failed'
+  let status = 'starting';
   let cancelReason = null;
   let failureError = null;
   let ytdlpBytes = 0;
@@ -315,12 +303,6 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     }
   }
 
-  /**
-   * Idempotent cleanup of streams, event listeners, and child processes.
-   *
-   * @param {string} [reason='dispose']
-   * @returns {Promise<{ sessionId: string, status: string, reason: string }>}
-   */
   function cleanup(reason = 'dispose') {
     if (cleanupPromise) {
       return cleanupPromise;
@@ -403,11 +385,9 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     });
   }
 
-  // 3. Attach stderr listeners
   ytdlpProcess.stderr?.on('data', (chunk) => appendBoundedStderr(ytdlpStderr, chunk));
   ffmpegProcess.stderr?.on('data', (chunk) => appendBoundedStderr(ffmpegStderr, chunk));
 
-  // 4. Attach process error listeners (e.g. async ENOENT)
   let immediateSpawnError = null;
 
   ytdlpProcess.on('error', (err) => {
@@ -444,7 +424,6 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     recordFailure(wrapped);
   });
 
-  // 5. Wire yt-dlp.stdout -> ffmpeg.stdin with backpressure & broken pipe handling
   if (ytdlpProcess.stdout && ffmpegProcess.stdin) {
     ytdlpProcess.stdout.on('data', (chunk) => {
       ytdlpBytes += chunk.length;
@@ -481,7 +460,6 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     ytdlpProcess.stdout.pipe(ffmpegProcess.stdin);
   }
 
-  // 6. Wire ffmpeg.stdout -> pcmStream with backpressure
   if (ffmpegProcess.stdout) {
     ffmpegProcess.stdout.on('data', (chunk) => {
       pcmBytes += chunk.length;
@@ -505,11 +483,8 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     ffmpegProcess.stdout.pipe(pcmStream, { end: false });
   }
 
-  pcmStream.on('error', () => {
-    // Prevent unhandled error event on PassThrough stream when destroyed with an error
-  });
+  pcmStream.on('error', () => {});
 
-  // 7. Handle process exit / close lifecycle
   ytdlpProcess.once('close', (code, signal) => {
     ytdlpExited = true;
     ytdlpExitCode = code ?? (signal ? -1 : 0);
@@ -593,13 +568,11 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     }
   });
 
-  // Yield a microtask/immediate tick so synchronous/immediate ENOENT spawn errors surface right away
   await new Promise((resolve) => setImmediate(resolve));
   if (immediateSpawnError) {
     throw immediateSpawnError;
   }
 
-  // 8. Construct the @discordjs/voice AudioResource with StreamType.Raw and inlineVolume
   const resource = createResourceFn(pcmStream, {
     inputType: StreamType.Raw,
     inlineVolume: true,
@@ -609,12 +582,14 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     }
   });
 
+  // Use linear setVolume instead of setVolumeLogarithmic so 100% is true 1.0x unity gain
+  // without attenuating quiet tracks or over-clipping 16-bit integer PCM samples.
   if (options.volume !== undefined && resource?.volume) {
     const normalizedVol = Math.max(0, Number(options.volume)) / 100;
-    if (typeof resource.volume.setVolumeLogarithmic === 'function') {
-      resource.volume.setVolumeLogarithmic(normalizedVol);
-    } else if (typeof resource.volume.setVolume === 'function') {
+    if (typeof resource.volume.setVolume === 'function') {
       resource.volume.setVolume(normalizedVol);
+    } else if (typeof resource.volume.setVolumeLogarithmic === 'function') {
+      resource.volume.setVolumeLogarithmic(normalizedVol);
     }
   }
 
@@ -649,5 +624,6 @@ export default {
   validateExtractionTarget,
   buildYtdlpArgs,
   buildFfmpegArgs,
-  terminateProcessSafely
+  terminateProcessSafely,
+  HIGH_QUALITY_AUDIO_FILTER
 };

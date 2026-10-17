@@ -2,7 +2,8 @@ import { fileURLToPath } from 'node:url';
 import {
   Client,
   GatewayIntentBits,
-  Events
+  Events,
+  generateDependencyReport
 } from './utils/discordSdk.js';
 import { loadConfig, getSafeConfigSummary } from './config.js';
 import { Logger } from './utils/logger.js';
@@ -63,11 +64,25 @@ export function createBotApplication(options = {}) {
   let isShuttingDown = false;
 
   client.once(Events.ClientReady, (readyClient) => {
+    const depReport = typeof generateDependencyReport === 'function' ? generateDependencyReport() : '';
+    const hasDaveSupport =
+      depReport.includes('@snazzah/davey') && !depReport.includes('@snazzah/davey: not found');
+
     log.info('Discord client connected and ready', {
       botUser: readyClient?.user?.tag || client.user?.tag || 'unknown',
       commandsLoaded: commandHandler.commands.size,
+      daveE2eeReady: hasDaveSupport,
       config: getSafeConfigSummary(cfg)
     });
+
+    if (depReport && !hasDaveSupport && !depReport.includes('Offline Test SDK')) {
+      log.warn(
+        'Discord DAVE E2EE library (@snazzah/davey) is missing or @discordjs/voice is outdated (<0.19.0). Voice connections will stall in Connecting and time out waiting for Ready!',
+        { dependencyReport: depReport }
+      );
+    } else if (cfg.LOG_LEVEL === 'debug' && depReport) {
+      log.debug('Voice dependency report', { dependencyReport: depReport });
+    }
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
@@ -84,7 +99,6 @@ export function createBotApplication(options = {}) {
     await commandHandler.handlePrefixMessage(message);
   });
 
-  // Handle when the bot itself is forcibly disconnected or moved via Discord UI
   client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     const botId = client.user?.id;
     if (!botId || oldState?.id !== botId) {
@@ -107,15 +121,6 @@ export function createBotApplication(options = {}) {
     log.warn('Discord client warning', { warning });
   });
 
-  /**
-   * Perform ordered graceful shutdown (Section 11):
-   * 1. Stop accepting new playback requests.
-   * 2. Clear idle timers.
-   * 3. Stop active players.
-   * 4. Dispose of audio streams and child processes.
-   * 5. Destroy voice connections.
-   * 6. Destroy the Discord client.
-   */
   async function shutdown(signal = 'SIGTERM') {
     if (isShuttingDown) {
       return;

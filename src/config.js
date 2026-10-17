@@ -13,13 +13,6 @@ const PLACEHOLDER_PATTERNS = [
   /^token_here$/i
 ];
 
-/**
- * Parse a .env file from disk without requiring external packages,
- * populating missing keys in the target environment object.
- *
- * @param {string} envFilePath
- * @param {Record<string, string | undefined>} targetEnv
- */
 export function loadDotEnvFile(envFilePath = path.resolve(process.cwd(), '.env'), targetEnv = process.env) {
   if (!fs.existsSync(envFilePath)) {
     return false;
@@ -66,9 +59,6 @@ export function loadDotEnvFile(envFilePath = path.resolve(process.cwd(), '.env')
   return true;
 }
 
-/**
- * Parse an integer configuration variable with strict validation and bounds checking.
- */
 export function parseIntOption(name, rawValue, defaultValue, { min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER } = {}) {
   if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
     return defaultValue;
@@ -92,9 +82,6 @@ export function parseIntOption(name, rawValue, defaultValue, { min = Number.MIN_
   return parsed;
 }
 
-/**
- * Parse a boolean configuration variable explicitly.
- */
 export function parseBooleanOption(name, rawValue, defaultValue) {
   if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') {
     return defaultValue;
@@ -143,15 +130,6 @@ function validateSnowflake(name, value, required = false) {
   return trimmed;
 }
 
-/**
- * Load and validate configuration from an environment object.
- *
- * @param {Record<string, string | undefined>} [env=process.env]
- * @param {object} [options]
- * @param {boolean} [options.requireCredentials=true]
- * @param {boolean} [options.loadDotEnv=true]
- * @param {string} [options.dotEnvPath]
- */
 export function loadConfig(env = process.env, options = {}) {
   const {
     requireCredentials = true,
@@ -197,7 +175,7 @@ export function loadConfig(env = process.env, options = {}) {
   }
 
   const maxVolume = parseIntOption('MAX_VOLUME', env.MAX_VOLUME, 200, { min: 1, max: 500 });
-  const defaultVolume = parseIntOption('DEFAULT_VOLUME', env.DEFAULT_VOLUME, 80, {
+  const defaultVolume = parseIntOption('DEFAULT_VOLUME', env.DEFAULT_VOLUME, 100, {
     min: 0,
     max: maxVolume
   });
@@ -346,9 +324,6 @@ export function loadConfig(env = process.env, options = {}) {
   return Object.freeze(configObj);
 }
 
-/**
- * Return a safe summary of the configuration with secrets redacted.
- */
 export function getSafeConfigSummary(cfg) {
   return {
     DISCORD_TOKEN: cfg.DISCORD_TOKEN ? '[REDACTED]' : null,

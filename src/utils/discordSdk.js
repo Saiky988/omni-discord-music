@@ -196,6 +196,16 @@ class FallbackEmbedBuilder {
     this.data.color = color;
     return this;
   }
+  setAuthor(author) {
+    if (author && author.name) {
+      this.data.author = {
+        name: String(author.name).slice(0, 256),
+        icon_url: author.iconURL || author.icon_url,
+        url: author.url
+      };
+    }
+    return this;
+  }
   setTitle(title) {
     this.data.title = title ? String(title).slice(0, 256) : undefined;
     return this;
@@ -245,6 +255,59 @@ class FallbackEmbedBuilder {
       out.fields = out.fields.map((f) => ({ ...f }));
     }
     return out;
+  }
+}
+
+const FallbackButtonStyle = Object.freeze({
+  Primary: 1,
+  Secondary: 2,
+  Success: 3,
+  Danger: 4,
+  Link: 5
+});
+
+class FallbackButtonBuilder {
+  constructor(initial = {}) {
+    this.data = { type: 2, ...initial };
+  }
+  setCustomId(customId) {
+    this.data.custom_id = String(customId);
+    return this;
+  }
+  setLabel(label) {
+    this.data.label = String(label).slice(0, 80);
+    return this;
+  }
+  setEmoji(emoji) {
+    this.data.emoji = typeof emoji === 'string' ? { name: emoji } : emoji;
+    return this;
+  }
+  setStyle(style) {
+    this.data.style = style;
+    return this;
+  }
+  setDisabled(disabled = true) {
+    this.data.disabled = Boolean(disabled);
+    return this;
+  }
+  toJSON() {
+    return { ...this.data };
+  }
+}
+
+class FallbackActionRowBuilder {
+  constructor() {
+    this.components = [];
+  }
+  addComponents(...items) {
+    this.components.push(...items.flat());
+    return this;
+  }
+  toJSON() {
+    return {
+      type: 1,
+      components: this.components.map((c) => (typeof c.toJSON === 'function' ? c.toJSON() : c))
+    };
   }
 }
 
@@ -402,7 +465,7 @@ class FallbackAudioPlayer extends EventEmitter {
     this.subscribers = [];
   }
 
-   transitionTo(nextState) {
+  transitionTo(nextState) {
     const oldState = this.state;
     this.state = nextState;
     this.emit('stateChange', oldState, nextState);
@@ -567,12 +630,19 @@ function fallbackEntersState(target, status, timeoutOrSignal = 10000) {
   });
 }
 
+function fallbackGenerateDependencyReport() {
+  return 'Offline Test SDK Mode (@discordjs/voice not installed in node_modules)';
+}
+
 export const Client = discordJsModule?.Client || FallbackClient;
 export const Collection = discordJsModule?.Collection || FallbackCollection;
 export const GatewayIntentBits = discordJsModule?.GatewayIntentBits || FallbackGatewayIntentBits;
 export const Events = discordJsModule?.Events || FallbackEvents;
 export const SlashCommandBuilder = discordJsModule?.SlashCommandBuilder || FallbackSlashCommandBuilder;
 export const EmbedBuilder = discordJsModule?.EmbedBuilder || FallbackEmbedBuilder;
+export const ActionRowBuilder = discordJsModule?.ActionRowBuilder || FallbackActionRowBuilder;
+export const ButtonBuilder = discordJsModule?.ButtonBuilder || FallbackButtonBuilder;
+export const ButtonStyle = discordJsModule?.ButtonStyle || FallbackButtonStyle;
 export const PermissionFlagsBits = discordJsModule?.PermissionFlagsBits || FallbackPermissionFlagsBits;
 export const MessageFlags = discordJsModule?.MessageFlags || FallbackMessageFlags;
 export const REST = discordJsModule?.REST || FallbackREST;
@@ -593,6 +663,8 @@ export const joinVoiceChannel =
 export const getVoiceConnection =
   discordVoiceModule?.getVoiceConnection || fallbackGetVoiceConnection;
 export const entersState = discordVoiceModule?.entersState || fallbackEntersState;
+export const generateDependencyReport =
+  discordVoiceModule?.generateDependencyReport || fallbackGenerateDependencyReport;
 
 export const playDl = playDlModule;
 export const isNativeDiscordSdkInstalled = Boolean(discordJsModule && discordVoiceModule);

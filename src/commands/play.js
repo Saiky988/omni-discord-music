@@ -3,7 +3,8 @@ import {
   buildNowPlayingEmbed,
   buildTrackQueuedEmbed,
   buildPlaylistAddedEmbed,
-  buildInvalidInputEmbed
+  buildInvalidInputEmbed,
+  buildPlayerControlRow
 } from '../utils/embeds.js';
 
 export const data = new SlashCommandBuilder()
@@ -53,7 +54,6 @@ export async function execute(context) {
     };
   }
 
-  // Validate voice channel match BEFORE resolving if the bot is already active in another channel
   const existingSnapshot = queueManager.getSnapshot(guildId);
   if (
     existingSnapshot.exists &&
@@ -82,9 +82,10 @@ export async function execute(context) {
     });
 
     return {
-      embeds: [
-        buildPlaylistAddedEmbed(resolved, queueResult, queueResult.snapshot)
-      ]
+      embeds: [buildPlaylistAddedEmbed(resolved, queueResult, queueResult.snapshot)],
+      components: queueResult.startedPlayback
+        ? [buildPlayerControlRow(queueResult.snapshot)]
+        : []
     };
   }
 
@@ -98,16 +99,13 @@ export async function execute(context) {
 
   if (queueResult.startedPlayback) {
     return {
-      embeds: [
-        buildNowPlayingEmbed(track, queueResult.snapshot)
-      ]
+      embeds: [buildNowPlayingEmbed(track, queueResult.snapshot)],
+      components: [buildPlayerControlRow(queueResult.snapshot)]
     };
   }
 
   return {
-    embeds: [
-      buildTrackQueuedEmbed(track, queueResult.queuePosition, queueResult.snapshot)
-    ]
+    embeds: [buildTrackQueuedEmbed(track, queueResult.queuePosition, queueResult.snapshot)]
   };
 }
 

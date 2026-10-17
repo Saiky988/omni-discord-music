@@ -1,8 +1,13 @@
-import { EmbedBuilder } from './discordSdk.js';
+import {
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle
+} from './discordSdk.js';
 
 /**
- * Consistent Discord Embed builders and safe text formatting helpers.
- * Neutralizes user-controlled markdown/mentions and enforces Discord embed size limits.
+ * Compact, mobile-first Discord Embed builders and interactive control bar.
+ * Designed to avoid tall vertical field stacks on mobile while keeping key track info clear.
  */
 
 export const EmbedColors = Object.freeze({
@@ -18,14 +23,14 @@ export const EmbedColors = Object.freeze({
 const SOURCE_LABELS = Object.freeze({
   youtube: 'YouTube',
   youtube_music: 'YouTube Music',
-  spotify: 'Spotify (Resolved)',
-  apple_music: 'Apple Music (Resolved)',
+  spotify: 'Spotify',
+  apple_music: 'Apple Music',
   soundcloud: 'SoundCloud',
   tiktok: 'TikTok',
   douyin: 'Douyin',
   facebook: 'Facebook',
   instagram: 'Instagram',
-  direct_media: 'Direct Media'
+  direct_media: 'Direct Audio'
 });
 
 const LOOP_LABELS = Object.freeze({
@@ -37,10 +42,6 @@ const LOOP_LABELS = Object.freeze({
 /**
  * Escape user-controlled text so it cannot trigger @everyone/@here mentions,
  * misleading masked links, or runaway formatting blocks.
- *
- * @param {unknown} text
- * @param {number} [maxLength=256]
- * @returns {string}
  */
 export function sanitizeDisplayText(text, maxLength = 256) {
   if (text === null || text === undefined) {
@@ -68,10 +69,6 @@ export function sanitizeDisplayText(text, maxLength = 256) {
 
 /**
  * Format duration in seconds into MM:SS or HH:MM:SS.
- *
- * @param {number | null | undefined} seconds
- * @param {boolean} [isLive=false]
- * @returns {string}
  */
 export function formatDuration(seconds, isLive = false) {
   if (isLive) {
@@ -93,9 +90,9 @@ export function formatDuration(seconds, isLive = false) {
 }
 
 export function formatSourceLabel(source, isFallback = false) {
-  const base = SOURCE_LABELS[source] || sanitizeDisplayText(source || 'Unknown', 40);
-  if (isFallback && !base.includes('(Resolved)')) {
-    return `${base} (Fallback)`;
+  const base = SOURCE_LABELS[source] || sanitizeDisplayText(source || 'Music', 32);
+  if (isFallback && source !== 'spotify' && source !== 'apple_music') {
+    return `${base}`;
   }
   return base;
 }
@@ -118,165 +115,181 @@ function applySafeThumbnail(embed, thumbnailUrl) {
   }
 }
 
-function applySafeUrl(embed, url) {
-  if (!url || typeof url !== 'string') {
-    return;
-  }
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
-      embed.setURL(parsed.toString());
-    }
-  } catch {
-    // Ignore malformed URLs
-  }
+/**
+ * Build interactive player control buttons for Now Playing cards.
+ */
+export function buildPlayerControlRow(queueState = {}) {
+  const isPaused = queueState.state === 'paused' || queueState.state === 'autopaused';
+  const loopMode = queueState.loopMode || 'off';
+
+  const pauseResumeBtn = new ButtonBuilder()
+    .setCustomId('music:toggle_pause')
+    .setLabel(isPaused ? 'Resume' : 'Pause')
+    .setEmoji(isPaused ? '▶️' : '⏸️')
+    .setStyle(isPaused ? ButtonStyle.Success : ButtonStyle.Secondary);
+
+  const skipBtn = new ButtonBuilder()
+    .setCustomId('music:skip')
+    .setLabel('Skip')
+    .setEmoji('⏭️')
+    .setStyle(ButtonStyle.Secondary);
+
+  const loopLabel = loopMode === 'track' ? 'Loop: Track' : loopMode === 'queue' ? 'Loop: Queue' : 'Loop: Off';
+  const loopBtn = new ButtonBuilder()
+    .setCustomId('music:cycle_loop')
+    .setLabel(loopLabel)
+    .setEmoji(loopMode === 'track' ? '🔂' : '🔁')
+    .setStyle(loopMode === 'off' ? ButtonStyle.Secondary : ButtonStyle.Primary);
+
+  const queueBtn = new ButtonBuilder()
+    .setCustomId('music:queue')
+    .setLabel('Queue')
+    .setEmoji('📋')
+    .setStyle(ButtonStyle.Secondary);
+
+  const stopBtn = new ButtonBuilder()
+    .setCustomId('music:stop')
+    .setLabel('Stop')
+    .setEmoji('⏹️')
+    .setStyle(ButtonStyle.Danger);
+
+  return new ActionRowBuilder().addComponents(
+    pauseResumeBtn,
+    skipBtn,
+    loopBtn,
+    queueBtn,
+    stopBtn
+  );
 }
 
+/**
+ * Sleek, compact Now Playing card (no bloated vertical field list on mobile).
+ */
 export function buildNowPlayingEmbed(track, queueState = {}) {
-  const title = sanitizeDisplayText(track?.title || 'Untitled Track', 220);
-  const artist = track?.artist ? sanitizeDisplayText(track.artist, 120) : 'Unknown Artist';
-  const requester = sanitizeDisplayText(track?.requestedBy || 'Unknown', 80);
+  const title = sanitizeDisplayText(track?.title || 'Untitled Track', 140);
+  const artist = track?.artist ? sanitizeDisplayText(track.artist, 60) : null;
+  const requester = sanitizeDisplayText(track?.requestedBy || 'Unknown', 50);
   const duration = formatDuration(track?.duration, track?.isLive);
   const source = formatSourceLabel(track?.source, track?.isFallback);
-  const loopMode = formatLoopMode(queueState.loopMode);
-  const volume = queueState.volume !== undefined ? `${queueState.volume}%` : '80%';
+
+  const titleLine = track?.webpageUrl
+    ? `**[${title}](${track.webpageUrl})**`
+    : `**${title}**`;
+
+  const pills = [];
+  if (artist) pills.push(`\`${artist}\``);
+  pills.push(`\`${duration}\``);
+  if (queueState.loopMode && queueState.loopMode !== 'off') {
+    pills.push(`\`🔁 ${formatLoopMode(queueState.loopMode)}\``);
+  }
+  if (queueState.upcomingCount > 0) {
+    pills.push(`\`+${queueState.upcomingCount} in queue\``);
+  }
 
   const embed = new EmbedBuilder()
     .setColor(EmbedColors.PLAYING)
+    .setAuthor({ name: `🎵 Now Playing  •  ${source}` })
     .setTitle('Now Playing')
-    .setDescription(
-      track?.webpageUrl
-        ? `**[${title}](${track.webpageUrl})**`
-        : `**${title}**`
-    )
-    .addFields(
-      { name: 'Artist / Channel', value: artist, inline: true },
-      { name: 'Duration', value: duration, inline: true },
-      { name: 'Source', value: source, inline: true },
-      { name: 'Requested By', value: requester, inline: true },
-      { name: 'Loop Mode', value: loopMode, inline: true },
-      { name: 'Volume', value: volume, inline: true }
-    )
-    .setTimestamp();
+    .setDescription(`${titleLine}\n${pills.join('  •  ')}`)
+    .setFooter({ text: `Requested by ${requester}` });
 
-  applySafeUrl(embed, track?.webpageUrl);
   applySafeThumbnail(embed, track?.thumbnail);
   return embed;
 }
 
-export function buildTrackQueuedEmbed(track, position, queueState = {}) {
-  const title = sanitizeDisplayText(track?.title || 'Untitled Track', 220);
-  const artist = track?.artist ? sanitizeDisplayText(track.artist, 120) : 'Unknown Artist';
-  const requester = sanitizeDisplayText(track?.requestedBy || 'Unknown', 80);
+/**
+ * Sleek, compact Added to Queue card.
+ */
+export function buildTrackQueuedEmbed(track, position, _queueState = {}) {
+  const title = sanitizeDisplayText(track?.title || 'Untitled Track', 140);
+  const artist = track?.artist ? sanitizeDisplayText(track.artist, 60) : null;
+  const requester = sanitizeDisplayText(track?.requestedBy || 'Unknown', 50);
   const duration = formatDuration(track?.duration, track?.isLive);
   const source = formatSourceLabel(track?.source, track?.isFallback);
-  const loopMode = formatLoopMode(queueState.loopMode);
+
+  const titleLine = track?.webpageUrl
+    ? `**[${title}](${track.webpageUrl})**`
+    : `**${title}**`;
+
+  const pills = [];
+  if (artist) pills.push(`\`${artist}\``);
+  pills.push(`\`${duration}\``);
+  pills.push(`\`#${position} in queue\``);
 
   const embed = new EmbedBuilder()
     .setColor(EmbedColors.PRIMARY)
+    .setAuthor({ name: `➕ Added to Queue  •  ${source}` })
     .setTitle('Added to Queue')
-    .setDescription(
-      track?.webpageUrl
-        ? `**[${title}](${track.webpageUrl})**`
-        : `**${title}**`
-    )
-    .addFields(
-      { name: 'Artist / Channel', value: artist, inline: true },
-      { name: 'Duration', value: duration, inline: true },
-      { name: 'Source', value: source, inline: true },
-      { name: 'Queue Position', value: `#${position}`, inline: true },
-      { name: 'Requested By', value: requester, inline: true },
-      { name: 'Loop Mode', value: loopMode, inline: true }
-    )
-    .setTimestamp();
+    .setDescription(`${titleLine}\n${pills.join('  •  ')}`)
+    .setFooter({ text: `Requested by ${requester}` });
 
-  applySafeUrl(embed, track?.webpageUrl);
   applySafeThumbnail(embed, track?.thumbnail);
   return embed;
 }
 
+/**
+ * Sleek, compact Playlist Added card.
+ */
 export function buildPlaylistAddedEmbed(playlistInfo, queueResult, queueState = {}) {
-  const title = sanitizeDisplayText(playlistInfo?.title || 'Playlist', 200);
+  const title = sanitizeDisplayText(playlistInfo?.title || 'Playlist', 140);
   const source = formatSourceLabel(playlistInfo?.source);
-  const requester = sanitizeDisplayText(playlistInfo?.requestedBy || 'Unknown', 80);
+  const requester = sanitizeDisplayText(playlistInfo?.requestedBy || 'Unknown', 50);
   const addedCount = queueResult.addedCount ?? 0;
   const skippedCount = (playlistInfo?.skippedTracks ?? 0) + (queueResult.droppedByQueueLimit ?? 0);
-  const startedNow = Boolean(queueResult.startedPlayback);
 
-  const statusText = startedNow
-    ? 'Started playing first track and queued the remaining tracks.'
-    : 'Queued all accepted tracks behind current playback.';
+  const titleLine = playlistInfo?.webpageUrl
+    ? `**[${title}](${playlistInfo.webpageUrl})**`
+    : `**${title}**`;
+
+  const summaryParts = [`Queued **${addedCount}** tracks`];
+  if (skippedCount > 0) {
+    summaryParts.push(`*(${skippedCount} skipped)*`);
+  }
+  if (queueState.upcomingCount > 0) {
+    summaryParts.push(`• \`${queueState.upcomingCount} waiting\``);
+  }
 
   const embed = new EmbedBuilder()
     .setColor(EmbedColors.SUCCESS)
+    .setAuthor({ name: `📚 Playlist Added  •  ${source}` })
     .setTitle('Playlist Added')
-    .setDescription(`**${title}**\n${statusText}`)
-    .addFields(
-      { name: 'Tracks Queued', value: String(addedCount), inline: true },
-      { name: 'Tracks Skipped', value: String(skippedCount), inline: true },
-      { name: 'Source', value: source, inline: true },
-      { name: 'Requested By', value: requester, inline: true },
-      { name: 'Loop Mode', value: formatLoopMode(queueState.loopMode), inline: true },
-      { name: 'Total in Queue', value: String(queueState.upcomingCount ?? addedCount), inline: true }
-    )
-    .setTimestamp();
+    .setDescription(`${titleLine}\n${summaryParts.join(' ')}`)
+    .setFooter({ text: `Requested by ${requester}` });
 
-  applySafeUrl(embed, playlistInfo?.webpageUrl);
   applySafeThumbnail(embed, playlistInfo?.thumbnail);
   return embed;
 }
 
-export function buildPausedEmbed(track, queueState = {}) {
-  const title = sanitizeDisplayText(track?.title || 'Current Track', 220);
+export function buildPausedEmbed(track) {
+  const title = sanitizeDisplayText(track?.title || 'Current Track', 140);
   return new EmbedBuilder()
     .setColor(EmbedColors.PAUSED)
-    .setTitle('Playback Paused')
-    .setDescription(`Paused **${title}**.`)
-    .addFields(
-      { name: 'Loop Mode', value: formatLoopMode(queueState.loopMode), inline: true },
-      { name: 'Upcoming Tracks', value: String(queueState.upcomingCount ?? 0), inline: true }
-    )
-    .setTimestamp();
+    .setDescription(`⏸️ **Paused** — ${title}`);
 }
 
-export function buildResumedEmbed(track, queueState = {}) {
-  const title = sanitizeDisplayText(track?.title || 'Current Track', 220);
+export function buildResumedEmbed(track) {
+  const title = sanitizeDisplayText(track?.title || 'Current Track', 140);
   return new EmbedBuilder()
     .setColor(EmbedColors.PLAYING)
-    .setTitle('Playback Resumed')
-    .setDescription(`Resumed **${title}**.`)
-    .addFields(
-      { name: 'Loop Mode', value: formatLoopMode(queueState.loopMode), inline: true },
-      { name: 'Upcoming Tracks', value: String(queueState.upcomingCount ?? 0), inline: true }
-    )
-    .setTimestamp();
+    .setDescription(`▶️ **Resumed** — ${title}`);
 }
 
-export function buildSkippedEmbed(skippedTrack, nextTrack, queueState = {}) {
-  const skippedTitle = sanitizeDisplayText(skippedTrack?.title || 'Track', 200);
-  const nextDescription = nextTrack
-    ? `Up next: **${sanitizeDisplayText(nextTrack.title, 180)}**`
-    : 'The queue is now empty.';
+export function buildSkippedEmbed(skippedTrack, nextTrack) {
+  const skippedTitle = sanitizeDisplayText(skippedTrack?.title || 'Track', 120);
+  const nextLine = nextTrack
+    ? `\n↳ *Up next:* **${sanitizeDisplayText(nextTrack.title, 120)}** \`[${formatDuration(nextTrack.duration, nextTrack.isLive)}]\``
+    : '\n↳ *Queue is now empty.*';
 
   return new EmbedBuilder()
     .setColor(EmbedColors.INFO)
-    .setTitle('Track Skipped')
-    .setDescription(`Skipped **${skippedTitle}**.\n${nextDescription}`)
-    .addFields(
-      { name: 'Loop Mode', value: formatLoopMode(queueState.loopMode), inline: true },
-      { name: 'Remaining in Queue', value: String(queueState.upcomingCount ?? 0), inline: true }
-    )
-    .setTimestamp();
+    .setDescription(`⏭️ **Skipped** — ${skippedTitle}${nextLine}`);
 }
 
 export function buildStoppedEmbed(clearedCount = 0) {
+  const suffix = clearedCount > 0 ? ` and cleared **${clearedCount}** queued track(s)` : '';
   return new EmbedBuilder()
     .setColor(EmbedColors.WARNING)
-    .setTitle('Playback Stopped')
-    .setDescription(
-      `Stopped playback, disabled loop mode, and cleared **${clearedCount}** queued track(s).`
-    )
-    .setTimestamp();
+    .setDescription(`⏹️ **Stopped playback**${suffix}.`);
 }
 
 export function buildQueueEmbed(snapshot, page = 1, pageSize = 10) {
@@ -288,60 +301,52 @@ export function buildQueueEmbed(snapshot, page = 1, pageSize = 10) {
   const slice = tracks.slice(startIdx, startIdx + pageSize);
 
   const nowPlayingBlock = current
-    ? `**Now Playing:** ${sanitizeDisplayText(current.title, 160)} \`[${formatDuration(current.duration, current.isLive)}]\` — *Requested by ${sanitizeDisplayText(current.requestedBy, 50)}*`
-    : '**Now Playing:** Nothing is currently playing.';
+    ? `▶️ **Now Playing**\n**[${sanitizeDisplayText(current.title, 110)}](${current.webpageUrl || 'https://discord.com'})** \`${formatDuration(current.duration, current.isLive)}\``
+    : '⏹️ **Nothing is currently playing.**';
 
-  let upcomingBlock = 'No upcoming tracks in queue.';
+  let upcomingBlock = '*No upcoming tracks in queue.*';
   if (slice.length > 0) {
     upcomingBlock = slice
       .map((item, idx) => {
         const pos = startIdx + idx + 1;
-        const tTitle = sanitizeDisplayText(item.title, 110);
+        const tTitle = sanitizeDisplayText(item.title, 85);
         const dur = formatDuration(item.duration, item.isLive);
-        const req = sanitizeDisplayText(item.requestedBy || 'Unknown', 40);
-        return `\`${pos}.\` **${tTitle}** \`[${dur}]\` • ${req}`;
+        return `\`${pos}.\` ${tTitle} \`${dur}\``;
       })
       .join('\n');
   }
 
-  const description = `${nowPlayingBlock}\n\n**Upcoming Tracks:**\n${upcomingBlock}`.slice(0, 4000);
+  const description = `${nowPlayingBlock}\n\n**Up Next (${tracks.length})**\n${upcomingBlock}`.slice(0, 4000);
+  const footerPills = [`Page ${safePage}/${totalPages}`];
+  if (snapshot.loopMode && snapshot.loopMode !== 'off') {
+    footerPills.push(`Loop: ${formatLoopMode(snapshot.loopMode)}`);
+  }
+  footerPills.push(`Vol: ${snapshot.volume ?? 100}%`);
 
   return new EmbedBuilder()
     .setColor(EmbedColors.PRIMARY)
-    .setTitle('Server Music Queue')
+    .setAuthor({ name: '📋 Server Queue' })
     .setDescription(description)
-    .addFields(
-      { name: 'Status', value: sanitizeDisplayText(snapshot.state || 'idle', 32), inline: true },
-      { name: 'Queued Tracks', value: String(tracks.length), inline: true },
-      { name: 'Loop Mode', value: formatLoopMode(snapshot.loopMode), inline: true },
-      { name: 'Volume', value: `${snapshot.volume ?? 80}%`, inline: true }
-    )
-    .setFooter({ text: `Page ${safePage} of ${totalPages}` })
-    .setTimestamp();
+    .setFooter({ text: footerPills.join('  •  ') });
 }
 
 export function buildVolumeEmbed(volume, maxVolume = 200) {
   return new EmbedBuilder()
     .setColor(EmbedColors.INFO)
-    .setTitle('Volume Updated')
-    .setDescription(`Playback volume set to **${volume}%** (Max: ${maxVolume}%).`)
-    .setTimestamp();
+    .setDescription(`🔊 **Volume:** \`${volume}%\` *(Max: ${maxVolume}%)*`);
 }
 
 export function buildLoopEmbed(loopMode) {
+  const icon = loopMode === 'track' ? '🔂' : '🔁';
   return new EmbedBuilder()
     .setColor(EmbedColors.INFO)
-    .setTitle('Loop Mode Updated')
-    .setDescription(`Loop mode is now set to **${formatLoopMode(loopMode)}**.`)
-    .setTimestamp();
+    .setDescription(`${icon} **Loop Mode:** \`${formatLoopMode(loopMode)}\``);
 }
 
 export function buildErrorEmbed(title, message) {
   return new EmbedBuilder()
     .setColor(EmbedColors.ERROR)
-    .setTitle(sanitizeDisplayText(title || 'Error', 120))
-    .setDescription(sanitizeDisplayText(message || 'An unexpected error occurred.', 1500))
-    .setTimestamp();
+    .setDescription(`⚠️ **${sanitizeDisplayText(title || 'Notice', 80)}** — ${sanitizeDisplayText(message || 'An unexpected error occurred.', 600)}`);
 }
 
 export function buildNoPermissionEmbed(detail = 'You do not have permission to perform this action.') {
@@ -357,12 +362,12 @@ export function buildUnsupportedSourceEmbed(detail = 'The requested URL or media
 }
 
 export function buildExtractionFailureEmbed(trackTitle, detail = 'Could not extract playable audio for this track.') {
-  const safeTitle = trackTitle ? sanitizeDisplayText(trackTitle, 140) : 'requested track';
-  return buildErrorEmbed('Audio Extraction Failed', `Failed to play **${safeTitle}**: ${sanitizeDisplayText(detail, 500)}`);
+  const safeTitle = trackTitle ? sanitizeDisplayText(trackTitle, 110) : 'requested track';
+  return buildErrorEmbed('Playback Skipped', `Could not play **${safeTitle}**: ${sanitizeDisplayText(detail, 300)}`);
 }
 
 export function buildConnectionRecoveryFailureEmbed(
-  detail = 'Voice connection was interrupted and could not be recovered. The queue has been cleared.'
+  detail = 'Voice connection was interrupted and could not be recovered.'
 ) {
-  return buildErrorEmbed('Voice Connection Lost', detail);
+  return buildErrorEmbed('Voice Disconnected', detail);
 }
