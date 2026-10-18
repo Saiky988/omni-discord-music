@@ -481,12 +481,20 @@ export function createCommandHandler(options = {}) {
       return null;
     }
 
-    const prefix = runtimeConfig.PREFIX || '!';
-    if (!message.content.startsWith(prefix)) {
+    const configuredPrefix = runtimeConfig.PREFIX || '!';
+    const rawContent = message.content;
+    let matchedPrefix = null;
+    if (rawContent.startsWith(configuredPrefix)) {
+      matchedPrefix = configuredPrefix;
+    } else if (rawContent.toLowerCase().startsWith('n!')) {
+      matchedPrefix = rawContent.slice(0, 2);
+    }
+
+    if (!matchedPrefix) {
       return null;
     }
 
-    const withoutPrefix = message.content.slice(prefix.length).trim();
+    const withoutPrefix = rawContent.slice(matchedPrefix.length).trim();
     if (!withoutPrefix) {
       return null;
     }

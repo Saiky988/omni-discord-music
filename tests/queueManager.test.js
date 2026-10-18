@@ -355,3 +355,54 @@ test('QueueManager — live bassboost, nightcore, and speed filters hot-reload a
 
   await queueManager.shutdownAll();
 });
+
+test('QueueManager — Lazy Resolution resolves active track just-in-time and prefetches only the next track', async () => {
+  const resolvedQueries = [];
+  const mockResolver = {
+    async resolveSearchQuery(searchQuery, { originalMeta }) {
+      resolvedQueries.push(searchQuery);
+      return {
+        track: {
+          ...originalMeta,
+          query: `https://www.youtube.com/watch?v=lazy_${resolvedQueries.length}`,
+          lazyResolve: false
+        }
+      };
+    }
+  };
+
+  const { queueManager, createdSessions } = createHarness();
+  queueManager.resolver = mockResolver;
+
+  const lazyTracks = [1, 2, 3].map((n) => ({
+    ...createTrack(String(n)),
+    query: `ytsearch1:Lazy Song ${n}`,
+    lazyResolve: true,
+    lazySearchQuery: `Artist ${n} - Lazy Song ${n} official audio`
+  }));
+
+  await queueManager.enqueue('guild-lazy', lazyTracks, {
+    voiceChannelId: 'vc-lazy'
+  });
+
+  // Track 1 resolved immediately before playing, and Track 2 prefetched in background;
+  // Track 3 MUST remain lazy until Track 2 starts playing!
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(createdSessions[0].query, 'https://www.youtube.com/watch?v=lazy_1');
+  assert.equal(resolvedQueries.length, 2);
+
+  const queue = queueManager.getQueue('guild-lazy');
+  assert.equal(queue.tracks[0].lazyResolve, false);
+  assert.equal(queue.tracks[0].query, 'https://www.youtube.com/watch?v=lazy_2');
+  assert.equal(queue.tracks[1].lazyResolve, true);
+
+  // When Track 1 finishes, Track 2 plays immediately (already resolved) and Track 3 prefetches
+  await queueManager.handleNaturalTrackCompletion(queue, queue.activeSessionId);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(createdSessions[1].query, 'https://www.youtube.com/watch?v=lazy_2');
+  assert.equal(resolvedQueries.length, 3);
+  assert.equal(queue.tracks[0].lazyResolve, false);
+  assert.equal(queue.tracks[0].query, 'https://www.youtube.com/watch?v=lazy_3');
+
+  await queueManager.shutdownAll();
+});

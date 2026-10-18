@@ -74,7 +74,8 @@ export async function execute(context) {
 
   const resolved = await resolver.resolve(rawQuery, {
     requestedBy: requesterTag,
-    eagerFirstTrackOnly: true
+    eagerFirstTrackOnly: true,
+    lazy: true
   });
 
   if (resolved.kind === 'playlist') {
@@ -82,7 +83,8 @@ export async function execute(context) {
       voiceChannelId,
       textChannelId,
       textChannel,
-      adapterCreator
+      adapterCreator,
+      asyncPlayback: true
     });
 
     // If the playlist has deferred tracks to resolve in the background, start them without blocking the reply
@@ -117,7 +119,8 @@ export async function execute(context) {
     voiceChannelId,
     textChannelId,
     textChannel,
-    adapterCreator
+    adapterCreator,
+    asyncPlayback: true
   });
 
   if (queueResult.startedPlayback) {

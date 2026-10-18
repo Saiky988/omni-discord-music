@@ -146,7 +146,9 @@ export function createNormalizedTrack({
   isLive = false,
   requestedBy = null,
   isFallback = false,
-  originalSource = null
+  originalSource = null,
+  lazyResolve = false,
+  lazySearchQuery = null
 }) {
   const normalizedTitle = title && String(title).trim()
     ? String(title).trim()
@@ -168,7 +170,9 @@ export function createNormalizedTrack({
     isLive: Boolean(isLive),
     requestedBy: requestedBy ?? null,
     isFallback: Boolean(isFallback),
-    originalSource: originalSource || null
+    originalSource: originalSource || null,
+    lazyResolve: Boolean(lazyResolve),
+    lazySearchQuery: lazySearchQuery || null
   };
 }
 
@@ -608,6 +612,7 @@ export class SourceResolver {
     this.config = options.config || config;
     this.logger = (options.logger || defaultLogger).child?.('resolver') || defaultLogger;
     this.playDl = options.playDl !== undefined ? options.playDl : defaultPlayDl;
+    this.hasCustomYtdlpExtractor = Boolean(options.ytdlpExtract);
     this.ytdlpExtract =
       options.ytdlpExtract ||
       createYtdlpMetadataExtractor({
@@ -632,6 +637,7 @@ export class SourceResolver {
   async resolve(rawInput, options = {}) {
     const requestedBy = options.requestedBy ?? null;
     const eagerFirstTrackOnly = Boolean(options.eagerFirstTrackOnly);
+    const lazy = Boolean(options.lazy);
 
     if (typeof rawInput !== 'string') {
       throw new InvalidInputError(
@@ -666,7 +672,7 @@ export class SourceResolver {
       const parsedUrl = parseAndValidateUrl(trimmed, {
         allowHttp: Boolean(this.config.ALLOW_HTTP_MEDIA)
       });
-      return this.resolveUrl(parsedUrl, { requestedBy, eagerFirstTrackOnly });
+      return this.resolveUrl(parsedUrl, { requestedBy, eagerFirstTrackOnly, lazy });
     }
 
     if (
@@ -857,7 +863,7 @@ export class SourceResolver {
     return parsedUrl;
   }
 
-  async resolveUrl(parsedUrl, { requestedBy = null, eagerFirstTrackOnly = false } = {}) {
+  async resolveUrl(parsedUrl, { requestedBy = null, eagerFirstTrackOnly = false, lazy = false } = {}) {
     let platform = detectUrlPlatform(parsedUrl);
     if (platform === 'unknown') {
       throw new UnsupportedSourceError(
@@ -870,11 +876,11 @@ export class SourceResolver {
     platform = detectUrlPlatform(parsedUrl) !== 'unknown' ? detectUrlPlatform(parsedUrl) : platform;
 
     if (platform === 'spotify') {
-      return this.resolveSpotifyUrl(parsedUrl, { requestedBy, eagerFirstTrackOnly });
+      return this.resolveSpotifyUrl(parsedUrl, { requestedBy, eagerFirstTrackOnly, lazy });
     }
 
     if (platform === 'apple_music') {
-      return this.resolveAppleMusicUrl(parsedUrl, { requestedBy, eagerFirstTrackOnly });
+      return this.resolveAppleMusicUrl(parsedUrl, { requestedBy, eagerFirstTrackOnly, lazy });
     }
 
     if (platform === 'direct_media') {
@@ -885,7 +891,7 @@ export class SourceResolver {
       return this.resolveExtractorPlaylist(parsedUrl, platform, { requestedBy });
     }
 
-    return this.resolveExtractorSingle(parsedUrl, platform, { requestedBy });
+    return this.resolveExtractorSingle(parsedUrl, platform, { requestedBy, lazy });
   }
 
   async resolveDirectMedia(parsedUrl, { requestedBy = null } = {}) {
@@ -1052,7 +1058,7 @@ export class SourceResolver {
     }
   }
 
-  async resolveExtractorSingle(parsedUrl, platform, { requestedBy = null } = {}) {
+  async resolveExtractorSingle(parsedUrl, platform, { requestedBy = null, lazy = false } = {}) {
     const isYt = platform === 'youtube' || platform === 'youtube_music';
     const urlStr = isYt
       ? canonicalizeYouTubeUrl(parsedUrl, platform)
@@ -1066,6 +1072,31 @@ export class SourceResolver {
         requestedBy
       });
       return wrapSingleTrackResult(track);
+    }
+
+    // Fast metadata path for live commands: grab title/thumbnail via lightweight API first
+    if (lazy && !this.hasCustomYtdlpExtractor) {
+      if (isYt) {
+        const fastYt = await this.fallbackResolveYouTubeMetadata(urlStr, platform);
+        if (fastYt) {
+          this.cache.set(cacheKey, fastYt);
+          const track = createNormalizedTrack({
+            ...fastYt,
+            requestedBy
+          });
+          return wrapSingleTrackResult(track);
+        }
+      } else if (platform === 'tiktok') {
+        const fastTikTok = await this.fallbackResolveTikTok(urlStr);
+        if (fastTikTok) {
+          this.cache.set(cacheKey, fastTikTok);
+          const track = createNormalizedTrack({
+            ...fastTikTok,
+            requestedBy
+          });
+          return wrapSingleTrackResult(track);
+        }
+      }
     }
 
     let meta = null;
@@ -1261,7 +1292,7 @@ export class SourceResolver {
     });
   }
 
-  async resolveSpotifyUrl(parsedUrl, { requestedBy = null, eagerFirstTrackOnly = false } = {}) {
+  async resolveSpotifyUrl(parsedUrl, { requestedBy = null, eagerFirstTrackOnly = false, lazy = false } = {}) {
     const classification = parseSpotifyUrlType(parsedUrl);
     if (!classification) {
       throw new InvalidInputError(
@@ -1283,6 +1314,25 @@ export class SourceResolver {
         ? `${metadata.artist} - ${metadata.title} official audio`
         : `${metadata.title} official audio`;
 
+      if (lazy) {
+        this.assertDurationAllowed(metadata.duration ?? null, false);
+        const lazyTrack = createNormalizedTrack({
+          title: metadata.title,
+          artist: metadata.artist || null,
+          query: `ytsearch1:${searchString}`,
+          source: 'spotify',
+          thumbnail: metadata.thumbnail || null,
+          duration: metadata.duration ?? null,
+          webpageUrl: `https://open.spotify.com/track/${classification.id}`,
+          requestedBy,
+          isFallback: true,
+          originalSource: 'spotify',
+          lazyResolve: true,
+          lazySearchQuery: searchString
+        });
+        return wrapSingleTrackResult(lazyTrack);
+      }
+
       return this.resolveSearchQuery(searchString, {
         requestedBy,
         originalMeta: {
@@ -1300,11 +1350,12 @@ export class SourceResolver {
       platform: 'spotify',
       webpageUrl: parsedUrl.toString(),
       requestedBy,
-      eagerFirstTrackOnly
+      eagerFirstTrackOnly,
+      lazy
     });
   }
 
-  async resolveAppleMusicUrl(parsedUrl, { requestedBy = null, eagerFirstTrackOnly = false } = {}) {
+  async resolveAppleMusicUrl(parsedUrl, { requestedBy = null, eagerFirstTrackOnly = false, lazy = false } = {}) {
     const classification = parseAppleMusicUrlType(parsedUrl);
     if (!classification) {
       throw new InvalidInputError(
@@ -1326,6 +1377,25 @@ export class SourceResolver {
         ? `${metadata.artist} - ${metadata.title} official audio`
         : `${metadata.title} official audio`;
 
+      if (lazy) {
+        this.assertDurationAllowed(metadata.duration ?? null, false);
+        const lazyTrack = createNormalizedTrack({
+          title: metadata.title,
+          artist: metadata.artist || null,
+          query: `ytsearch1:${searchString}`,
+          source: 'apple_music',
+          thumbnail: metadata.thumbnail || null,
+          duration: metadata.duration ?? null,
+          webpageUrl: parsedUrl.toString(),
+          requestedBy,
+          isFallback: true,
+          originalSource: 'apple_music',
+          lazyResolve: true,
+          lazySearchQuery: searchString
+        });
+        return wrapSingleTrackResult(lazyTrack);
+      }
+
       return this.resolveSearchQuery(searchString, {
         requestedBy,
         originalMeta: {
@@ -1343,13 +1413,14 @@ export class SourceResolver {
       platform: 'apple_music',
       webpageUrl: parsedUrl.toString(),
       requestedBy,
-      eagerFirstTrackOnly
+      eagerFirstTrackOnly,
+      lazy
     });
   }
 
   async resolveMetadataCollection(
     collectionMeta,
-    { platform, webpageUrl, requestedBy, eagerFirstTrackOnly = false }
+    { platform, webpageUrl, requestedBy, eagerFirstTrackOnly = false, lazy = false }
   ) {
     const rawItems = Array.isArray(collectionMeta?.tracks) ? collectionMeta.tracks : [];
     if (rawItems.length === 0) {
@@ -1364,6 +1435,71 @@ export class SourceResolver {
     const slice = rawItems.slice(0, maxTracks);
     let skippedTracks = truncated ? rawItems.length - maxTracks : 0;
     const warnings = [];
+
+    // Instant Lazy Resolution for playlists/albums: enqueue all tracks immediately with metadata
+    // and resolve each track's playable stream just-in-time before playback!
+    if (lazy) {
+      const lazyTracks = [];
+      for (const item of slice) {
+        if (!item || item.unavailable || !item.title) {
+          skippedTracks += 1;
+          continue;
+        }
+        const duration = Number.isFinite(item.duration) ? item.duration : null;
+        if (
+          duration !== null &&
+          this.config.MAX_TRACK_DURATION_SECONDS &&
+          duration > this.config.MAX_TRACK_DURATION_SECONDS
+        ) {
+          skippedTracks += 1;
+          continue;
+        }
+        const searchStr = item.artist
+          ? `${item.artist} - ${item.title} official audio`
+          : `${item.title} official audio`;
+
+        lazyTracks.push(
+          createNormalizedTrack({
+            title: item.title,
+            artist: item.artist || null,
+            query: `ytsearch1:${searchStr}`,
+            source: platform,
+            thumbnail: item.thumbnail || collectionMeta.thumbnail || null,
+            duration,
+            webpageUrl: item.url || webpageUrl,
+            requestedBy,
+            isFallback: true,
+            originalSource: platform,
+            lazyResolve: true,
+            lazySearchQuery: searchStr
+          })
+        );
+      }
+
+      if (lazyTracks.length === 0) {
+        throw new ResolutionError(
+          `Could not resolve any playable tracks for ${platform} collection.`,
+          'None of the tracks in that collection are available for playback.'
+        );
+      }
+
+      if (skippedTracks > 0) {
+        warnings.push(`${skippedTracks} track(s) were unavailable or exceeded the playlist limit.`);
+      }
+
+      return wrapPlaylistResult({
+        title: collectionMeta.title || `${platform === 'spotify' ? 'Spotify' : 'Apple Music'} Collection`,
+        source: platform,
+        webpageUrl,
+        thumbnail: collectionMeta.thumbnail || lazyTracks[0]?.thumbnail || null,
+        requestedBy,
+        tracks: lazyTracks,
+        totalTracks: rawItems.length,
+        skippedTracks,
+        truncated,
+        warnings
+      });
+    }
 
     const resolveSingleCollectionItem = async (item) => {
       if (!item || item.unavailable || !item.title) {

@@ -330,7 +330,19 @@ class FallbackClient extends EventEmitter {
     if (!token || typeof token !== 'string') {
       throw new Error('TOKEN_INVALID');
     }
-    this.user = { id: '000000000000000000', tag: 'omni-discord-music#0000' };
+    this.user = {
+      id: '000000000000000000',
+      tag: 'omni-discord-music#0000',
+      presence: this.options?.presence || null,
+      setActivity: (name, opts = {}) => {
+        this.user.presence = { activities: [{ name, ...opts }], status: 'online' };
+        return this.user.presence;
+      },
+      setPresence: (presence) => {
+        this.user.presence = presence;
+        return this.user.presence;
+      }
+    };
     return token;
   }
   destroy() {
@@ -360,6 +372,15 @@ const FallbackRoutes = Object.freeze({
   applicationCommands: (clientId) => `/applications/${clientId}/commands`,
   applicationGuildCommands: (clientId, guildId) =>
     `/applications/${clientId}/guilds/${guildId}/commands`
+});
+
+const FallbackActivityType = Object.freeze({
+  Playing: 0,
+  Streaming: 1,
+  Listening: 2,
+  Watching: 3,
+  Custom: 4,
+  Competing: 5
 });
 
 const FallbackGatewayIntentBits = Object.freeze({
@@ -643,6 +664,7 @@ function fallbackGenerateDependencyReport() {
 
 export const Client = discordJsModule?.Client || FallbackClient;
 export const Collection = discordJsModule?.Collection || FallbackCollection;
+export const ActivityType = discordJsModule?.ActivityType || FallbackActivityType;
 export const GatewayIntentBits = discordJsModule?.GatewayIntentBits || FallbackGatewayIntentBits;
 export const Events = discordJsModule?.Events || FallbackEvents;
 export const SlashCommandBuilder = discordJsModule?.SlashCommandBuilder || FallbackSlashCommandBuilder;

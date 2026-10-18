@@ -1,3 +1,4 @@
+import { defaultResolver } from './resolver.js';
 import crypto from 'node:crypto';
 import config from '../config.js';
 import {
@@ -35,6 +36,7 @@ export class QueueManager {
     this.config = options.config || config;
     this.logger = (options.logger || defaultLogger).child?.('queueManager') || defaultLogger;
     this.createStreamFn = options.createStreamFn || defaultCreateAudioStream;
+    this.resolver = options.resolver || defaultResolver;
     this.createPlayerFn = options.createPlayerFn || defaultCreateAudioPlayer;
     this.joinVoiceFn = options.joinVoiceFn || defaultJoinVoiceChannel;
     this.entersStateFn = options.entersStateFn || defaultEntersState;
@@ -163,6 +165,72 @@ export class QueueManager {
    * Compute estimated elapsed playback position in seconds for the current track
    * so mid-song filter toggles (bassboost, nightcore, speed) resume smoothly.
    */
+  /**
+   * Just-In-Time (Lazy) resolution: resolves a metadata-only track into a playable
+   * stream URL right before playback (or when prefetched as the next upcoming track).
+   */
+  async ensureTrackResolved(track) {
+    if (!track || !track.lazyResolve || !this.resolver || typeof this.resolver.resolveSearchQuery !== 'function') {
+      return track;
+    }
+
+    if (track._resolvePromise) {
+      return track._resolvePromise;
+    }
+
+    track._resolvePromise = (async () => {
+      try {
+        const searchQuery =
+          track.lazySearchQuery ||
+          (track.artist ? `${track.artist} - ${track.title} official audio` : `${track.title} official audio`);
+
+        const resolved = await this.resolver.resolveSearchQuery(searchQuery, {
+          requestedBy: track.requestedBy,
+          originalMeta: {
+            title: track.title,
+            artist: track.artist,
+            source: track.source,
+            thumbnail: track.thumbnail,
+            duration: track.duration,
+            webpageUrl: track.webpageUrl
+          }
+        });
+
+        const resolvedTrack = resolved?.track || resolved;
+        if (resolvedTrack?.query) {
+          track.query = resolvedTrack.query;
+          track.duration = track.duration ?? resolvedTrack.duration;
+          track.thumbnail = track.thumbnail || resolvedTrack.thumbnail;
+        }
+        track.lazyResolve = false;
+        delete track._resolvePromise;
+        return track;
+      } catch (err) {
+        delete track._resolvePromise;
+        throw err;
+      }
+    })();
+
+    return track._resolvePromise;
+  }
+
+  /**
+   * Pre-resolve only the immediately upcoming track (queue.tracks[0]) in the background
+   * while the current track is playing, keeping the rest of the queue lazy.
+   */
+  prefetchNextTrack(queue) {
+    const nextTrack = queue?.tracks?.[0];
+    if (nextTrack && nextTrack.lazyResolve && !nextTrack._resolvePromise) {
+      void this.ensureTrackResolved(nextTrack).catch((err) => {
+        this.logger.debug('Background lazy prefetch for next track failed; will retry on play', {
+          guildId: queue.guildId,
+          title: nextTrack.title,
+          error: err.message
+        });
+      });
+    }
+  }
+
   getCurrentTrackElapsedSeconds(queue) {
     if (!queue || !queue.currentTrack || queue.currentTrack.isLive) {
       return 0;
@@ -448,13 +516,6 @@ export class QueueManager {
       textChannel: options.textChannel
     });
 
-    if (options.voiceChannelId) {
-      await this.ensureVoiceConnection(queue, {
-        voiceChannelId: options.voiceChannelId,
-        adapterCreator: options.adapterCreator
-      });
-    }
-
     this.clearIdleTimer(queue);
 
     const maxQueueSize = this.config.MAX_QUEUE_SIZE || 500;
@@ -486,6 +547,61 @@ export class QueueManager {
 
     queue.tracks.push(...acceptedForQueue);
 
+    // Fast non-blocking playback startup for live commands so Discord gets the embed reply immediately
+    if (options.asyncPlayback && this.createStreamFn === defaultCreateAudioStream) {
+      if (trackToStartImmediately) {
+        queue.currentTrack = trackToStartImmediately;
+        queue.state = 'playing';
+
+        const snap = this.getSnapshot(guildId);
+        void (async () => {
+          try {
+            if (options.voiceChannelId) {
+              await this.ensureVoiceConnection(queue, {
+                voiceChannelId: options.voiceChannelId,
+                adapterCreator: options.adapterCreator
+              });
+            }
+            await this.startTrackPlayback(queue, trackToStartImmediately, {
+              announce: false
+            });
+          } catch (err) {
+            this.logger.warn('Async playback startup failed', {
+              guildId,
+              error: err.message
+            });
+          }
+        })();
+
+        return {
+          startedPlayback: true,
+          activeTrack: trackToStartImmediately,
+          addedCount: 1 + acceptedForQueue.length,
+          droppedByQueueLimit,
+          queuePosition: 0,
+          snapshot: snap
+        };
+      }
+
+      this.prefetchNextTrack(queue);
+      const firstQueuedPosition = queue.tracks.length - acceptedForQueue.length + 1;
+      return {
+        startedPlayback: false,
+        activeTrack: queue.currentTrack,
+        addedCount: acceptedForQueue.length,
+        droppedByQueueLimit,
+        queuePosition: firstQueuedPosition,
+        snapshot: this.getSnapshot(guildId)
+      };
+    }
+
+    if (options.voiceChannelId) {
+      await this.ensureVoiceConnection(queue, {
+        voiceChannelId: options.voiceChannelId,
+        adapterCreator: options.adapterCreator
+      });
+    }
+
     if (trackToStartImmediately) {
       await this.startTrackPlayback(queue, trackToStartImmediately, {
         announce: false
@@ -501,6 +617,7 @@ export class QueueManager {
       };
     }
 
+    this.prefetchNextTrack(queue);
     const firstQueuedPosition = queue.tracks.length - acceptedForQueue.length + 1;
     return {
       startedPlayback: false,
@@ -534,6 +651,18 @@ export class QueueManager {
     queue.trackPositionBaseSec = seekSeconds > 0 ? seekSeconds : 0;
     queue.trackStartedAtMs = Date.now();
     queue.state = 'buffering';
+
+    if (track.lazyResolve) {
+      try {
+        await this.ensureTrackResolved(track);
+      } catch (err) {
+        await this.handleSessionFailure(queue, sessionId, err);
+        return;
+      }
+      if (queue.activeSessionId !== sessionId || queue.state === 'destroyed') {
+        return;
+      }
+    }
 
     const useDirectFfmpeg =
       this.createStreamFn === defaultCreateAudioStream &&
@@ -594,6 +723,7 @@ export class QueueManager {
     try {
       queue.player.play(streamSession.resource);
       queue.state = 'playing';
+      this.prefetchNextTrack(queue);
       if (announce) {
         const snap = this.getSnapshot(queue.guildId);
         await this.notifyGuildChannel(queue, {

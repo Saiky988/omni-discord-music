@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import {
   Client,
+  ActivityType,
   GatewayIntentBits,
   Events,
   generateDependencyReport
@@ -37,7 +38,16 @@ export function createBotApplication(options = {}) {
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent
-      ]
+      ],
+      presence: {
+        activities: [
+          {
+            name: cfg.BOT_STATUS || 'n!help',
+            type: ActivityType.Listening
+          }
+        ],
+        status: 'online'
+      }
     });
 
   const resolver =
@@ -51,7 +61,8 @@ export function createBotApplication(options = {}) {
     options.queueManager ||
     new QueueManager({
       config: cfg,
-      logger: log
+      logger: log,
+      resolver
     });
 
   const commandHandler = createCommandHandler({
@@ -64,6 +75,14 @@ export function createBotApplication(options = {}) {
   let isShuttingDown = false;
 
   client.once(Events.ClientReady, (readyClient) => {
+    const botUser = readyClient?.user || client.user;
+    try {
+      botUser?.setActivity?.(cfg.BOT_STATUS || 'n!help', {
+        type: ActivityType.Listening
+      });
+    } catch (err) {
+      log.debug('Failed to set bot activity status', { error: err.message });
+    }
     const depReport = typeof generateDependencyReport === 'function' ? generateDependencyReport() : '';
     const hasDaveSupport =
       depReport.includes('@snazzah/davey') && !depReport.includes('@snazzah/davey: not found');

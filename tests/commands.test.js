@@ -191,3 +191,32 @@ test('Deploy Commands — registers guild-scoped or global slash commands cleanl
   assert.equal(globalDeploy.scope, 'global');
   assert.equal(routesCalled.length, 2);
 });
+
+test('Bot Status & n!help Prefix — defaults BOT_STATUS to n!help and accepts n!help prefix', async () => {
+  const cfg = loadConfig(
+    {
+      DISCORD_TOKEN: 'valid_test_token_value_1234567890',
+      DISCORD_CLIENT_ID: '123456789012345678'
+    },
+    { requireCredentials: true, loadDotEnv: false }
+  );
+  assert.equal(cfg.BOT_STATUS, 'n!help');
+
+  const handler = createCommandHandler({
+    config: { PREFIX: '!', BOT_STATUS: 'n!help', MAX_VOLUME: 200 }
+  });
+
+  let helpReply = null;
+  await handler.handlePrefixMessage({
+    content: 'n!help',
+    author: { id: 'u1', tag: 'user#0001', bot: false },
+    guild: { id: 'guild-1' },
+    member: { voice: { channel: null } },
+    reply: async (payload) => {
+      helpReply = payload;
+    }
+  });
+
+  assert.ok(helpReply?.embeds?.length === 1);
+  assert.ok(helpReply.embeds[0].toJSON().title.includes('Commands'));
+});

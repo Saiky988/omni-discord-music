@@ -289,12 +289,16 @@ export function loadConfig(env = process.env, options = {}) {
   );
 
   const allowHttpMedia = parseBooleanOption('ALLOW_HTTP_MEDIA', env.ALLOW_HTTP_MEDIA, false);
+  const botStatus = env.BOT_STATUS !== undefined && String(env.BOT_STATUS).trim() !== ''
+    ? String(env.BOT_STATUS).trim()
+    : 'n!help';
 
   const configObj = {
     DISCORD_TOKEN: rawToken || null,
     DISCORD_CLIENT_ID: clientId,
     DISCORD_GUILD_ID: guildId,
     PREFIX: prefix,
+    BOT_STATUS: botStatus,
     DEFAULT_VOLUME: defaultVolume,
     MAX_VOLUME: maxVolume,
     IDLE_TIMEOUT_MS: idleTimeoutMs,
@@ -330,6 +334,7 @@ export function getSafeConfigSummary(cfg) {
     DISCORD_CLIENT_ID: cfg.DISCORD_CLIENT_ID,
     DISCORD_GUILD_ID: cfg.DISCORD_GUILD_ID,
     PREFIX: cfg.PREFIX,
+    BOT_STATUS: cfg.BOT_STATUS,
     DEFAULT_VOLUME: cfg.DEFAULT_VOLUME,
     MAX_VOLUME: cfg.MAX_VOLUME,
     IDLE_TIMEOUT_MS: cfg.IDLE_TIMEOUT_MS,
