@@ -430,7 +430,7 @@ export function createYtdlpMetadataExtractor({
         error: firstErr.message
       });
 
-      const isTikTok = target.includes('tiktok.com') || target.includes('douyin.com');
+      const isTikTok = target.includes('tiktok.com') || target.includes('douyin.com') || target.includes('iesdouyin.com');
       const retryArgs = isTikTok
         ? [
             ...baseArgs,
@@ -839,6 +839,7 @@ export class SourceResolver {
       host === 'on.soundcloud.com' ||
       host === 'vt.tiktok.com' ||
       host === 'vm.tiktok.com' ||
+      host === 'v.douyin.com' ||
       host === 'spotify.link'
     ) {
       const resolved = await this.redirectResolver(parsedUrl, {
@@ -855,10 +856,12 @@ export class SourceResolver {
       return cleaned;
     }
 
-    if (platform === 'tiktok') {
+    if (platform === 'tiktok' || platform === 'douyin') {
       const cleaned = new URL(parsedUrl.toString());
       cleaned.search = '';
-      cleaned.pathname = cleaned.pathname.replace(/\/photo\/(\d+)/, '/video/$1');
+      cleaned.pathname = cleaned.pathname
+        .replace(/\/photo\/(\d+)/, '/video/$1')
+        .replace(/\/note\/(\d+)/, '/video/$1');
       return cleaned;
     }
 
@@ -1054,87 +1057,156 @@ export class SourceResolver {
     return null;
   }
 
-  async fallbackResolveTikTok(tiktokUrl) {
+  async fallbackResolveTikTok(tiktokOrDouyinUrl, platform = 'tiktok') {
     if (typeof globalThis.fetch !== 'function') {
       return null;
     }
 
-    try {
-      const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(tiktokUrl)}`;
-      const res = await globalThis.fetch(apiUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) omni-discord-music/1.0',
-          Accept: 'application/json'
+    const allowHttp = Boolean(this.config.ALLOW_HTTP_MEDIA);
+
+    // 1. Try TikWM API with automatic retry if rate-limited (1 req / 1 sec)
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 1150 * attempt));
+      }
+
+      try {
+        const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(tiktokOrDouyinUrl)}`;
+        const res = await globalThis.fetch(apiUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) omni-discord-music/1.0',
+            Accept: 'application/json'
+          }
+        });
+
+        if (!res.ok) {
+          break;
         }
-      });
 
-      if (!res.ok) {
-        return null;
-      }
-
-      const payload = await res.json();
-      const data = payload?.data;
-      if (!data) {
-        return null;
-      }
-
-      // Prefer signed CDN play/music stream URL over /video/media/play/ fallback
-      const streamCandidate =
-        data.play ||
-        data.wmplay ||
-        data.music_info?.play ||
-        data.music ||
-        (data.id ? `https://www.tikwm.com/video/media/play/${data.id}.mp4` : null);
-
-      if (!streamCandidate || typeof streamCandidate !== 'string') {
-        return null;
-      }
-
-      const resolvedCandidate = new URL(streamCandidate, 'https://www.tikwm.com').toString();
-      const safeStreamUrl = parseAndValidateUrl(resolvedCandidate, {
-        allowHttp: Boolean(this.config.ALLOW_HTTP_MEDIA)
-      }).toString();
-
-      const duration =
-        Number.isFinite(Number(data.duration)) && Number(data.duration) > 0
-          ? Math.round(Number(data.duration))
-          : Number.isFinite(Number(data.music_info?.duration)) && Number(data.music_info?.duration) > 0
-            ? Math.round(Number(data.music_info.duration))
-            : null;
-
-      this.assertDurationAllowed(duration, false);
-
-      const rawThumb = data.cover || data.origin_cover || data.author?.avatar || null;
-      let thumbnail = null;
-      if (rawThumb && typeof rawThumb === 'string') {
-        try {
-          thumbnail = new URL(rawThumb, 'https://www.tikwm.com').toString();
-        } catch {
-          thumbnail = null;
+        const payload = await res.json();
+        if (payload?.code === -1) {
+          // Rate-limited (1 req/sec); wait and retry
+          continue;
         }
-      }
 
-      return {
-        title: data.title || data.music_info?.title || 'TikTok Audio',
-        artist: data.author?.nickname || data.author?.unique_id || data.music_info?.author || null,
-        query: safeStreamUrl,
-        source: 'tiktok',
-        thumbnail,
-        duration,
-        webpageUrl: tiktokUrl,
-        isLive: false
-      };
-    } catch (err) {
-      this.logger.debug('TikTok API fallback failed', {
-        url: tiktokUrl,
-        error: err.message
-      });
-      return null;
+        const data = payload?.data;
+        if (!data) {
+          break;
+        }
+
+        const streamCandidate =
+          data.play ||
+          data.wmplay ||
+          data.music_info?.play ||
+          data.music ||
+          (data.id ? `https://www.tikwm.com/video/media/play/${data.id}.mp4` : null);
+
+        if (!streamCandidate || typeof streamCandidate !== 'string') {
+          break;
+        }
+
+        const resolvedCandidate = new URL(streamCandidate, 'https://www.tikwm.com').toString();
+        const safeStreamUrl = parseAndValidateUrl(resolvedCandidate, { allowHttp }).toString();
+
+        const duration =
+          Number.isFinite(Number(data.duration)) && Number(data.duration) > 0
+            ? Math.round(Number(data.duration))
+            : Number.isFinite(Number(data.music_info?.duration)) && Number(data.music_info?.duration) > 0
+              ? Math.round(Number(data.music_info.duration))
+              : null;
+
+        this.assertDurationAllowed(duration, false);
+
+        const rawThumb = data.cover || data.origin_cover || data.author?.avatar || null;
+        let thumbnail = null;
+        if (rawThumb && typeof rawThumb === 'string') {
+          try {
+            thumbnail = new URL(rawThumb, 'https://www.tikwm.com').toString();
+          } catch {
+            thumbnail = null;
+          }
+        }
+
+        return {
+          title: data.title || data.music_info?.title || (platform === 'douyin' ? 'Douyin Audio' : 'TikTok Audio'),
+          artist: data.author?.nickname || data.author?.unique_id || data.music_info?.author || null,
+          query: safeStreamUrl,
+          source: platform,
+          thumbnail,
+          duration,
+          webpageUrl: tiktokOrDouyinUrl,
+          isLive: false
+        };
+      } catch (err) {
+        this.logger.debug('TikWM API fallback attempt failed', {
+          url: tiktokOrDouyinUrl,
+          attempt,
+          error: err.message
+        });
+      }
     }
+
+    // 2. For Douyin / iesdouyin links, also support direct mobile HTML _ROUTER_DATA extraction
+    if (
+      platform === 'douyin' ||
+      tiktokOrDouyinUrl.includes('douyin.com') ||
+      tiktokOrDouyinUrl.includes('iesdouyin.com')
+    ) {
+      try {
+        const res = await globalThis.fetch(tiktokOrDouyinUrl, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            Accept: 'text/html,application/xhtml+xml'
+          },
+          redirect: 'follow'
+        });
+
+        if (res.ok) {
+          const html = await res.text();
+          const routerMatch = html.match(/window\._ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/);
+          if (routerMatch?.[1]) {
+            const routerData = JSON.parse(routerMatch[1]);
+            const loaderData = routerData?.loaderData || {};
+            const pageObj = Object.values(loaderData).find((v) => v?.videoInfoRes?.item_list?.[0]);
+            const item = pageObj?.videoInfoRes?.item_list?.[0];
+            const rawPlayUrl = item?.video?.play_addr?.url_list?.[0];
+            if (item && rawPlayUrl) {
+              const cleanPlayUrl = rawPlayUrl.replace('playwm', 'play');
+              const safeStreamUrl = parseAndValidateUrl(cleanPlayUrl, { allowHttp }).toString();
+              const duration =
+                Number.isFinite(Number(item.video?.duration)) && Number(item.video?.duration) > 0
+                  ? Math.round(Number(item.video.duration) / 1000)
+                  : null;
+              this.assertDurationAllowed(duration, false);
+
+              return {
+                title: item.desc || 'Douyin Audio',
+                artist: item.author?.nickname || null,
+                query: safeStreamUrl,
+                source: 'douyin',
+                thumbnail: item.video?.cover?.url_list?.[0] || null,
+                duration,
+                webpageUrl: tiktokOrDouyinUrl,
+                isLive: false
+              };
+            }
+          }
+        }
+      } catch (err) {
+        this.logger.debug('Douyin mobile page fallback failed', {
+          url: tiktokOrDouyinUrl,
+          error: err.message
+        });
+      }
+    }
+
+    return null;
   }
 
   async resolveExtractorSingle(parsedUrl, platform, { requestedBy = null, lazy = false } = {}) {
     const isYt = platform === 'youtube' || platform === 'youtube_music';
+    const isTikTokOrDouyin = platform === 'tiktok' || platform === 'douyin';
     const urlStr = isYt
       ? canonicalizeYouTubeUrl(parsedUrl, platform)
       : parsedUrl.toString();
@@ -1161,8 +1233,8 @@ export class SourceResolver {
           });
           return wrapSingleTrackResult(track);
         }
-      } else if (platform === 'tiktok') {
-        const fastTikTok = await this.fallbackResolveTikTok(urlStr);
+      } else if (isTikTokOrDouyin) {
+        const fastTikTok = await this.fallbackResolveTikTok(urlStr, platform);
         if (fastTikTok) {
           this.cache.set(cacheKey, fastTikTok);
           const track = createNormalizedTrack({
@@ -1204,8 +1276,8 @@ export class SourceResolver {
       throw ytdlpError || new ResolutionError('Could not resolve YouTube track metadata.');
     }
 
-    if (!meta && platform === 'tiktok') {
-      const fallbackTikTok = await this.fallbackResolveTikTok(urlStr);
+    if (!meta && isTikTokOrDouyin) {
+      const fallbackTikTok = await this.fallbackResolveTikTok(urlStr, platform);
       if (fallbackTikTok) {
         this.cache.set(cacheKey, fallbackTikTok);
         const track = createNormalizedTrack({
@@ -1214,7 +1286,7 @@ export class SourceResolver {
         });
         return wrapSingleTrackResult(track);
       }
-      throw ytdlpError || new ResolutionError('Could not resolve TikTok media.');
+      throw ytdlpError || new ResolutionError(`Could not resolve ${platform} media.`);
     }
 
     if (!meta) {
@@ -1511,8 +1583,6 @@ export class SourceResolver {
     let skippedTracks = truncated ? rawItems.length - maxTracks : 0;
     const warnings = [];
 
-    // Instant Lazy Resolution for playlists/albums: enqueue all tracks immediately with metadata
-    // and resolve each track's playable stream just-in-time before playback!
     if (lazy) {
       const lazyTracks = [];
       for (const item of slice) {
@@ -1605,8 +1675,6 @@ export class SourceResolver {
       }
     };
 
-    // Fast path for live command execution: resolve ONLY the first playable track immediately
-    // so playback and the Discord embed reply happen right away, and resolve remaining tracks in background!
     if (eagerFirstTrackOnly && slice.length > 1) {
       let firstTrack = null;
       let startIndex = 0;

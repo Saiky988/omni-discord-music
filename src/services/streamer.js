@@ -3,8 +3,10 @@ dns.setDefaultResultOrder?.('ipv4first');
 import { spawn as defaultSpawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import config from '../config.js';
 import { createAudioResource, StreamType } from '../utils/discordSdk.js';
@@ -14,9 +16,11 @@ import {
   InvalidInputError,
   StreamExtractionError
 } from '../utils/errors.js';
-import { parseAndValidateUrl } from '../utils/urlSafety.js';
+import { parseAndValidateUrl, assertPublicDnsResolution } from '../utils/urlSafety.js';
 
 const MAX_STDERR_BYTES = 4096;
+const MAX_TEMP_MEDIA_BYTES = 100 * 1024 * 1024; // 100 MB cap for temp media spooling
+const MIN_SUBSTANTIAL_PCM_BYTES = 48000 * 2 * 2 * 5; // 5 seconds of 48kHz stereo s16le PCM
 const DOCUMENTED_SEARCH_TARGET_PATTERN = /^(ytsearch1|scsearch1):[^\0\r\n]{2,500}$/;
 
 export const BASSBOOST_PRESETS = Object.freeze({
@@ -155,6 +159,8 @@ export function buildYtdlpArgs(validatedTarget) {
  * @param {object} [options]
  * @param {object} [options.filters]
  * @param {number} [options.seekSeconds=0]
+ * @param {boolean} [options.isContainerPipe=false]
+ * @param {boolean} [options.isLocalFile=false]
  * @returns {string[]}
  */
 export function buildFfmpegArgs(directInputUrl = null, options = {}) {
@@ -165,6 +171,26 @@ export function buildFfmpegArgs(directInputUrl = null, options = {}) {
       : 0;
 
   if (directInputUrl) {
+    if (options.isLocalFile) {
+      const args = [];
+      if (seekSeconds > 0) {
+        args.push('-ss', String(seekSeconds));
+      }
+      args.push(
+        '-i', directInputUrl,
+        '-vn',
+        '-sn',
+        '-dn',
+        '-loglevel', '0',
+        '-af', filterChain,
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        'pipe:1'
+      );
+      return args;
+    }
+
     const args = [
       '-user_agent',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -190,12 +216,14 @@ export function buildFfmpegArgs(directInputUrl = null, options = {}) {
     return args;
   }
 
-  const args = [
-    '-i', 'pipe:0',
-    '-analyzeduration', '0',
-    '-probesize', '32768',
-    '-loglevel', '0'
-  ];
+  const args = ['-i', 'pipe:0'];
+  if (!options.isContainerPipe) {
+    args.push(
+      '-analyzeduration', '0',
+      '-probesize', '32768'
+    );
+  }
+  args.push('-loglevel', '0');
 
   if (seekSeconds > 0) {
     args.push('-ss', String(seekSeconds));
@@ -283,83 +311,282 @@ export function terminateProcessSafely(proc, killTimeoutMs = 2000) {
   });
 }
 
+function isTikTokOrDouyinWebpage(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  try {
+    const parsed = new URL(urlStr);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host.endsWith('tiktok.com') ||
+      host.endsWith('douyin.com') ||
+      host.endsWith('iesdouyin.com')
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Resolve a fresh, non-expired TikTok media stream via TikWM API and open a Node Readable stream
- * with browser User-Agent and Referer headers so FFmpeg can decode it from pipe:0 without
- * Cloudflare/TikTok CDN 403 blocks or expired token errors.
+ * Query TikWM API with automatic retry on 1-req/sec free rate limit (code === -1).
  */
-async function openTikTokHttpStream(tiktokWebpageOrStreamUrl, fallbackStreamUrl = null, allowHttp = false) {
-  if (typeof globalThis.fetch !== 'function') {
-    return null;
+async function fetchTikwmStreamUrls(webpageUrl, allowHttp = false) {
+  if (typeof globalThis.fetch !== 'function' || !webpageUrl) {
+    return [];
   }
 
   const browserHeaders = {
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     Referer: 'https://www.tikwm.com/',
-    Accept: '*/*'
+    Accept: 'application/json'
   };
 
-  const candidates = [];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, 1150 * attempt));
+    }
 
-  // If the URL is a TikTok post page, query TikWM right now for fresh signed CDN URLs
-  if (tiktokWebpageOrStreamUrl.includes('tiktok.com')) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    timer.unref?.();
+
     try {
-      const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(tiktokWebpageOrStreamUrl)}`;
+      const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(webpageUrl)}`;
       const apiRes = await globalThis.fetch(apiUrl, {
-        headers: {
-          ...browserHeaders,
-          Accept: 'application/json'
-        }
+        headers: browserHeaders,
+        signal: controller.signal
       });
+      clearTimeout(timer);
 
-      if (apiRes.ok) {
-        const payload = await apiRes.json();
-        const data = payload?.data;
-        if (data) {
-          for (const rawUrl of [data.play, data.wmplay, data.music_info?.play, data.music]) {
-            if (rawUrl && typeof rawUrl === 'string') {
-              try {
-                const resolved = new URL(rawUrl, 'https://www.tikwm.com').toString();
-                const validated = parseAndValidateUrl(resolved, { allowHttp }).toString();
-                if (!candidates.includes(validated)) {
-                  candidates.push(validated);
-                }
-              } catch {
-                // Ignore invalid candidate
-              }
+      if (!apiRes.ok) {
+        continue;
+      }
+
+      const payload = await apiRes.json();
+      if (payload?.code === -1) {
+        // Free API rate limit (1 req/sec) — wait and retry
+        continue;
+      }
+
+      const data = payload?.data;
+      if (!data) {
+        break;
+      }
+
+      const out = [];
+      for (const rawUrl of [data.play, data.wmplay, data.music_info?.play, data.music]) {
+        if (rawUrl && typeof rawUrl === 'string') {
+          try {
+            const resolved = new URL(rawUrl, 'https://www.tikwm.com').toString();
+            const validated = parseAndValidateUrl(resolved, { allowHttp }).toString();
+            if (!out.includes(validated)) {
+              out.push(validated);
             }
+          } catch {
+            // Ignore malformed candidate
           }
         }
       }
+      if (out.length > 0) {
+        return out;
+      }
     } catch {
-      // Fall through to direct candidate if present
+      clearTimeout(timer);
     }
-    if (fallbackStreamUrl && !fallbackStreamUrl.includes("tiktok.com/") && !candidates.includes(fallbackStreamUrl)) {
-      candidates.push(fallbackStreamUrl);
-    }
-  } else {
-    candidates.push(tiktokWebpageOrStreamUrl);
   }
 
-  for (const candidateUrl of candidates) {
+  return [];
+}
+
+/**
+ * Fallback extractor for Douyin / iesdouyin mobile share pages when TikWM is unavailable.
+ */
+async function fetchDouyinMobileStreamUrls(webpageUrl, allowHttp = false) {
+  if (typeof globalThis.fetch !== 'function' || !webpageUrl) {
+    return [];
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  timer.unref?.();
+
+  try {
+    const res = await globalThis.fetch(webpageUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        Accept: 'text/html,application/xhtml+xml'
+      },
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) return [];
+    const html = await res.text();
+    const routerMatch = html.match(/window\._ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/);
+    if (!routerMatch?.[1]) return [];
+
+    const routerData = JSON.parse(routerMatch[1]);
+    const loaderData = routerData?.loaderData || {};
+    const pageObj = Object.values(loaderData).find((v) => v?.videoInfoRes?.item_list?.[0]);
+    const item = pageObj?.videoInfoRes?.item_list?.[0];
+    const playUrls = item?.video?.play_addr?.url_list || [];
+    const out = [];
+
+    for (const raw of playUrls) {
+      if (raw && typeof raw === 'string') {
+        try {
+          const clean = raw.replace('playwm', 'play');
+          const validated = parseAndValidateUrl(clean, { allowHttp }).toString();
+          if (!out.includes(validated)) {
+            out.push(validated);
+          }
+        } catch {
+          // Ignore invalid URL
+        }
+      }
+    }
+    return out;
+  } catch {
+    clearTimeout(timer);
+    return [];
+  }
+}
+
+/**
+ * Download a TikTok, Douyin, Discord CDN, or direct media file to a temporary seekable file
+ * in os.tmpdir(). Having FFmpeg read from a seekable local file instead of pipe:0:
+ * 1) Prevents FFmpeg from failing with "moov atom not found" on non-faststart .mp4/.mov files
+ *    (such as SnapVideo/mobile uploads on Discord CDN).
+ * 2) Prevents TikTok/Discord CDNs from dropping idle/backpressured HTTP connections mid-song or on loop.
+ */
+async function downloadMediaToTempFile({
+  webpageUrl,
+  targetUrl,
+  sessionId,
+  allowHttp = false
+}) {
+  if (typeof globalThis.fetch !== 'function') {
+    return null;
+  }
+
+  const candidates = [];
+
+  // 1. If targetUrl is ALREADY a direct stream/CDN link (not a TikTok/Douyin post webpage),
+  // try it first so we don't trigger a redundant TikWM API call right after resolver.js!
+  if (targetUrl && !isTikTokOrDouyinWebpage(targetUrl)) {
+    candidates.push(targetUrl);
+  }
+
+  // 2. Gather TikWM / Douyin fresh candidates on demand
+  const pageUrl = isTikTokOrDouyinWebpage(webpageUrl)
+    ? webpageUrl
+    : isTikTokOrDouyinWebpage(targetUrl)
+      ? targetUrl
+      : null;
+
+  const loadPageCandidates = async () => {
+    if (!pageUrl) return [];
+    const fresh = await fetchTikwmStreamUrls(pageUrl, allowHttp);
+    if (fresh.length > 0) return fresh;
+    if (pageUrl.includes('douyin.com') || pageUrl.includes('iesdouyin.com')) {
+      return fetchDouyinMobileStreamUrls(pageUrl, allowHttp);
+    }
+    return [];
+  };
+
+  if (candidates.length === 0 && pageUrl) {
+    const fresh = await loadPageCandidates();
+    candidates.push(...fresh);
+  }
+
+  const attemptDownload = async (candidateUrl) => {
+    const parsed = parseAndValidateUrl(candidateUrl, { allowHttp });
+    await assertPublicDnsResolution(parsed.hostname);
+
+    const isDouyin = candidateUrl.includes('snssdk.com') || candidateUrl.includes('douyin');
+    const headers = {
+      'User-Agent': isDouyin
+        ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Accept: '*/*'
+    };
+    if (candidateUrl.includes('tikwm.com') || candidateUrl.includes('tiktok')) {
+      headers.Referer = 'https://www.tikwm.com/';
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+    timeout.unref?.();
+
+    const tempFilePath = path.join(os.tmpdir(), `omni-music-${sessionId}-${crypto.randomBytes(4).toString('hex')}.media`);
+
     try {
-      const controller = new AbortController();
       const res = await globalThis.fetch(candidateUrl, {
-        headers: browserHeaders,
+        headers,
         redirect: 'follow',
         signal: controller.signal
       });
 
       const contentType = (res.headers?.get?.('content-type') || '').toLowerCase();
-      if (res.ok && res.body && !contentType.includes('text/html') && !contentType.includes('application/json')) {
-        const nodeStream = Readable.fromWeb(res.body);
-        nodeStream.abortController = controller;
-        return nodeStream;
+      if (!res.ok || !res.body || contentType.includes('text/html') || contentType.includes('application/json')) {
+        clearTimeout(timeout);
+        controller.abort();
+        return null;
       }
-      controller.abort();
+
+      const contentLength = Number.parseInt(res.headers?.get?.('content-length') || '0', 10);
+      if (Number.isFinite(contentLength) && contentLength > MAX_TEMP_MEDIA_BYTES) {
+        clearTimeout(timeout);
+        controller.abort();
+        return null;
+      }
+
+      const nodeReadable = Readable.fromWeb(res.body);
+      let writtenBytes = 0;
+      nodeReadable.on('data', (chunk) => {
+        writtenBytes += chunk.length;
+        if (writtenBytes > MAX_TEMP_MEDIA_BYTES) {
+          controller.abort();
+        }
+      });
+
+      const fileWriteStream = fs.createWriteStream(tempFilePath, { mode: 0o600 });
+      await pipeline(nodeReadable, fileWriteStream);
+      clearTimeout(timeout);
+
+      if (writtenBytes < 256) {
+        await fs.promises.unlink(tempFilePath).catch(() => {});
+        return null;
+      }
+
+      return { tempFilePath, bytes: writtenBytes };
     } catch {
-      // Try next candidate
+      clearTimeout(timeout);
+      controller.abort();
+      await fs.promises.unlink(tempFilePath).catch(() => {});
+      return null;
+    }
+  };
+
+  for (const candidateUrl of candidates) {
+    const downloaded = await attemptDownload(candidateUrl);
+    if (downloaded) {
+      return downloaded;
+    }
+  }
+
+  // If the cached direct stream URL expired (e.g. when looping a TikTok/Douyin track minutes later),
+  // fetch fresh signed stream URLs from the original post webpageUrl now!
+  if (pageUrl && candidates.length > 0 && !candidates.includes(pageUrl)) {
+    const refreshed = await loadPageCandidates();
+    for (const candidateUrl of refreshed) {
+      if (candidates.includes(candidateUrl)) continue;
+      const downloaded = await attemptDownload(candidateUrl);
+      if (downloaded) {
+        return downloaded;
+      }
     }
   }
 
@@ -367,9 +594,8 @@ async function openTikTokHttpStream(tiktokWebpageOrStreamUrl, fallbackStreamUrl 
 }
 
 export async function createAudioStream(targetQueryOrUrl, options = {}) {
-  const validatedTarget = validateExtractionTarget(targetQueryOrUrl, {
-    allowHttp: options.allowHttp ?? config.ALLOW_HTTP_MEDIA
-  });
+  const allowHttp = Boolean(options.allowHttp ?? config.ALLOW_HTTP_MEDIA);
+  const validatedTarget = validateExtractionTarget(targetQueryOrUrl, { allowHttp });
 
   const sessionId = options.sessionId || crypto.randomUUID();
   const spawnFn = options.spawnFn || defaultSpawn;
@@ -380,39 +606,73 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
   const directFfmpeg = Boolean(options.directFfmpeg);
   const log = (options.logger || defaultLogger).child?.('streamer') || defaultLogger;
 
-  // For live TikTok OR direct media / Discord CDN attachments, stream via Node IPv4 fetch -> ffmpeg pipe:0
-  // so FFmpeg never hangs on broken IPv6 routes or fails probing MP4 video containers!
-  const shouldOpenNodeHttpPipe =
+  const isLiveStream = Boolean(options.isLive) || validatedTarget.toLowerCase().includes('.m3u8');
+
+  // For live production runs on TikTok, Douyin, Discord CDN, or direct media files,
+  // download to a seekable temp file in os.tmpdir() so MP4 containers with trailing moov atoms
+  // decode reliably and CDNs never drop throttled HTTP connections mid-song or on loop.
+  const shouldDownloadToTempFile =
     spawnFn === defaultSpawn &&
+    !isLiveStream &&
     (directFfmpeg ||
       options.source === 'tiktok' ||
+      options.source === 'douyin' ||
       options.source === 'direct_media' ||
       validatedTarget.includes('tiktok.com') ||
+      validatedTarget.includes('douyin.com') ||
+      validatedTarget.includes('iesdouyin.com') ||
       validatedTarget.includes('tikwm.com') ||
       validatedTarget.includes('tiktokcdn.com') ||
       validatedTarget.includes('cdn.discordapp.com') ||
       validatedTarget.includes('media.discordapp.net'));
 
-  let tiktokHttpStream = null;
-  if (shouldOpenNodeHttpPipe) {
-    tiktokHttpStream = await openTikTokHttpStream(
-      options.webpageUrl || validatedTarget,
-      validatedTarget,
-      Boolean(options.allowHttp ?? config.ALLOW_HTTP_MEDIA)
-    );
+  let tempMediaFile = null;
+  let downloadedBytes = 0;
+
+  if (shouldDownloadToTempFile) {
+    const downloadResult = await downloadMediaToTempFile({
+      webpageUrl: options.webpageUrl || null,
+      targetUrl: validatedTarget,
+      sessionId,
+      allowHttp
+    });
+    if (downloadResult?.tempFilePath) {
+      tempMediaFile = downloadResult.tempFilePath;
+      downloadedBytes = downloadResult.bytes || 0;
+    }
   }
 
-  const useHttpStreamPipe = Boolean(tiktokHttpStream);
-  const effectiveDirectFfmpeg = directFfmpeg && !useHttpStreamPipe;
-  const ytdlpArgs = effectiveDirectFfmpeg || useHttpStreamPipe ? [] : buildYtdlpArgs(validatedTarget);
+  const useLocalTempFile = Boolean(tempMediaFile);
+  const effectiveDirectFfmpeg = directFfmpeg || useLocalTempFile;
+
+  // If TikTok/Douyin temp download failed and we must fall back to yt-dlp, always pass the post webpageUrl
+  // rather than an expired TikWM/CDN direct link.
+  const ytdlpTarget =
+    !effectiveDirectFfmpeg &&
+    options.webpageUrl &&
+    isTikTokOrDouyinWebpage(options.webpageUrl) &&
+    !isTikTokOrDouyinWebpage(validatedTarget)
+      ? validateExtractionTarget(options.webpageUrl, { allowHttp })
+      : validatedTarget;
+
+  const ytdlpArgs = effectiveDirectFfmpeg ? [] : buildYtdlpArgs(ytdlpTarget);
+
+  const ffmpegInputTarget = useLocalTempFile
+    ? tempMediaFile
+    : effectiveDirectFfmpeg
+      ? validatedTarget
+      : null;
+
+  const isProductionRealSpawn = spawnFn === defaultSpawn;
   const ffmpegArgs =
-    options.filters || options.seekSeconds || useHttpStreamPipe
-      ? buildFfmpegArgs(effectiveDirectFfmpeg ? validatedTarget : null, {
+    options.filters || options.seekSeconds || useLocalTempFile || isProductionRealSpawn
+      ? buildFfmpegArgs(ffmpegInputTarget, {
           filters: options.filters,
           seekSeconds: options.seekSeconds,
-          isContainerPipe: useHttpStreamPipe
+          isLocalFile: useLocalTempFile,
+          isContainerPipe: !effectiveDirectFfmpeg && isProductionRealSpawn
         })
-      : buildFfmpegArgs(effectiveDirectFfmpeg ? validatedTarget : null);
+      : buildFfmpegArgs(ffmpegInputTarget);
 
   const events = new EventEmitter();
   const ytdlpStderr = { chunks: [], bytes: 0 };
@@ -420,18 +680,38 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
 
   let ytdlpProcess = null;
   let ffmpegProcess = null;
-  const pcmStream = new PassThrough({ highWaterMark: 128 * 1024 });
+  // 1 MB buffer (~5.5s of 48kHz stereo PCM) prevents micro-stalls on yt-dlp/ffmpeg pipes
+  const pcmStream = new PassThrough({ highWaterMark: 1024 * 1024 });
 
   let status = 'starting';
   let cancelReason = null;
   let failureError = null;
-  let ytdlpBytes = 0;
+  let ytdlpBytes = downloadedBytes;
   let pcmBytes = 0;
-  let ytdlpExited = effectiveDirectFfmpeg || useHttpStreamPipe;
+  let ytdlpExited = effectiveDirectFfmpeg;
   let ffmpegExited = false;
-  let ytdlpExitCode = effectiveDirectFfmpeg || useHttpStreamPipe ? 0 : null;
+  let ytdlpExitCode = effectiveDirectFfmpeg ? 0 : null;
   let ffmpegExitCode = null;
   let cleanupPromise = null;
+
+  async function removeTempMediaFile() {
+    if (!tempMediaFile) return;
+    const fileToDelete = tempMediaFile;
+    tempMediaFile = null;
+    await fs.promises.unlink(fileToDelete).catch(() => {});
+  }
+
+  function completeSessionNaturally() {
+    if (status === 'cancelled' || status === 'failed' || status === 'completed') {
+      return;
+    }
+    status = 'completed';
+    if (!pcmStream.writableEnded && !pcmStream.destroyed) {
+      pcmStream.end();
+    }
+    events.emit('completed', { sessionId, pcmBytes, ytdlpBytes });
+    void cleanup('completed');
+  }
 
   function recordFailure(err) {
     if (status === 'cancelled' || status === 'completed' || status === 'failed') {
@@ -478,13 +758,8 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     }
 
     if (ytdlpExited && ffmpegExited) {
-      if (ytdlpExitCode === 0 && ffmpegExitCode === 0 && pcmBytes > 0) {
-        status = 'completed';
-        if (!pcmStream.writableEnded && !pcmStream.destroyed) {
-          pcmStream.end();
-        }
-        events.emit('completed', { sessionId, pcmBytes, ytdlpBytes });
-        void cleanup('completed');
+      if (ffmpegExitCode === 0 && pcmBytes > 0 && (ytdlpExitCode === 0 || pcmBytes >= MIN_SUBSTANTIAL_PCM_BYTES)) {
+        completeSessionNaturally();
       } else if (pcmBytes === 0) {
         recordFailure(
           new StreamExtractionError(
@@ -535,16 +810,6 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
 
     cleanupPromise = (async () => {
       try {
-        if (tiktokHttpStream) {
-          try {
-            tiktokHttpStream.unpipe?.(ffmpegProcess?.stdin);
-            tiktokHttpStream.abortController?.abort?.();
-            tiktokHttpStream.destroy?.();
-          } catch {
-            // Ignore cleanup error
-          }
-        }
-
         if (ytdlpProcess?.stdout && ffmpegProcess?.stdin) {
           try {
             ytdlpProcess.stdout.unpipe(ffmpegProcess.stdin);
@@ -562,13 +827,32 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
         if (ffmpegProcess?.stdout && !ffmpegProcess.stdout.destroyed) {
           ffmpegProcess.stdout.destroy();
         }
-        if (!pcmStream.destroyed) {
+
+        // CRITICAL FIX: When reason === 'completed', do NOT destroy pcmStream while
+        // @discordjs/voice's AudioPlayer is still reading the buffered tail audio!
+        // Destroying pcmStream before it emits 'end' causes @discordjs/voice to throw
+        // AudioPlayerError ("Premature close") right at the end of a track or loop!
+        if (reason === 'completed') {
+          if (pcmStream.readableEnded || pcmStream.destroyed) {
+            if (!pcmStream.destroyed) pcmStream.destroy();
+          } else {
+            const drainTimer = setTimeout(() => {
+              if (!pcmStream.destroyed) {
+                pcmStream.destroy();
+              }
+            }, 15000);
+            drainTimer.unref?.();
+            pcmStream.once('end', () => clearTimeout(drainTimer));
+            pcmStream.once('close', () => clearTimeout(drainTimer));
+          }
+        } else if (!pcmStream.destroyed) {
           pcmStream.destroy();
         }
 
         await Promise.all([
           terminateProcessSafely(ytdlpProcess, killTimeoutMs),
-          terminateProcessSafely(ffmpegProcess, killTimeoutMs)
+          terminateProcessSafely(ffmpegProcess, killTimeoutMs),
+          removeTempMediaFile()
         ]);
       } finally {
         events.emit('disposed', { sessionId, status, reason });
@@ -580,7 +864,7 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     return cleanupPromise;
   }
 
-  if (!directFfmpeg && !useHttpStreamPipe) {
+  if (!effectiveDirectFfmpeg) {
     try {
       ytdlpProcess = spawnFn(ytdlpPath, ytdlpArgs, {
         shell: false,
@@ -588,6 +872,7 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
         windowsHide: true
       });
     } catch (err) {
+      await removeTempMediaFile();
       throw new StreamExtractionError(`Failed to spawn yt-dlp (${ytdlpPath}): ${err.message}`, {
         code: err.code === 'ENOENT' ? ErrorCodes.EXECUTABLE_MISSING : ErrorCodes.EXTRACTION_FAILED,
         userMessage: 'Could not start the yt-dlp audio extractor process.',
@@ -600,15 +885,14 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
   try {
     ffmpegProcess = spawnFn(ffmpegPath, ffmpegArgs, {
       shell: false,
-      stdio: [directFfmpeg ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      stdio: [effectiveDirectFfmpeg ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       windowsHide: true
     });
   } catch (err) {
-    if (tiktokHttpStream) {
-      tiktokHttpStream.abortController?.abort?.();
-      tiktokHttpStream.destroy?.();
-    }
-    await terminateProcessSafely(ytdlpProcess, killTimeoutMs);
+    await Promise.all([
+      terminateProcessSafely(ytdlpProcess, killTimeoutMs),
+      removeTempMediaFile()
+    ]);
     throw new StreamExtractionError(`Failed to spawn ffmpeg (${ffmpegPath}): ${err.message}`, {
       code: err.code === 'ENOENT' ? ErrorCodes.EXECUTABLE_MISSING : ErrorCodes.EXTRACTION_FAILED,
       userMessage: 'Could not start the FFmpeg audio transcoder process.',
@@ -656,29 +940,15 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     recordFailure(wrapped);
   });
 
-  if (useHttpStreamPipe && tiktokHttpStream && ffmpegProcess.stdin) {
-    tiktokHttpStream.on('data', (chunk) => {
-      ytdlpBytes += chunk.length;
-    });
-    tiktokHttpStream.on('error', (err) => {
-      if (status === 'cancelled' || status === 'completed') return;
-      recordFailure(
-        new StreamExtractionError(`TikTok HTTP stream error: ${err.message}`, {
-          code: ErrorCodes.EXTRACTION_FAILED,
-          context: { sessionId },
-          cause: err
-        })
-      );
-    });
-    ffmpegProcess.stdin.on('error', () => {});
-    tiktokHttpStream.pipe(ffmpegProcess.stdin);
-  } else if (ytdlpProcess?.stdout && ffmpegProcess.stdin) {
+  if (ytdlpProcess?.stdout && ffmpegProcess.stdin) {
     ytdlpProcess.stdout.on('data', (chunk) => {
       ytdlpBytes += chunk.length;
     });
 
     ytdlpProcess.stdout.on('error', (err) => {
-      if (status === 'cancelled') return;
+      if (status === 'cancelled' || status === 'completed' || pcmBytes >= MIN_SUBSTANTIAL_PCM_BYTES) {
+        return;
+      }
       recordFailure(
         new StreamExtractionError(`yt-dlp stdout stream error: ${err.message}`, {
           code: ErrorCodes.EXTRACTION_FAILED,
@@ -689,7 +959,7 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     });
 
     ffmpegProcess.stdin.on('error', (err) => {
-      if (status === 'cancelled' || status === 'completed') {
+      if (status === 'cancelled' || status === 'completed' || pcmBytes >= MIN_SUBSTANTIAL_PCM_BYTES) {
         return;
       }
       recordFailure(
@@ -718,7 +988,7 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     });
 
     ffmpegProcess.stdout.on('error', (err) => {
-      if (status === 'cancelled') return;
+      if (status === 'cancelled' || status === 'completed') return;
       recordFailure(
         new StreamExtractionError(`FFmpeg stdout stream error: ${err.message}`, {
           code: ErrorCodes.EXTRACTION_FAILED,
@@ -745,11 +1015,19 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
       }
     }
 
-    if (status === 'cancelled') {
+    if (status === 'cancelled' || status === 'completed') {
       return;
     }
 
     if (ytdlpExitCode !== 0) {
+      // If substantial audio was already decoded (e.g. >5s) and yt-dlp only hit a tail/EOF broken pipe,
+      // let FFmpeg finish draining its remaining buffer rather than failing the track at the end!
+      if (pcmBytes >= MIN_SUBSTANTIAL_PCM_BYTES) {
+        ytdlpExitCode = 0;
+        checkNaturalCompletion();
+        return;
+      }
+
       recordFailure(
         new StreamExtractionError(
           `yt-dlp exited with code ${ytdlpExitCode}: ${formatBoundedStderr(ytdlpStderr) || 'no stderr'}`,
@@ -774,11 +1052,19 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
     ffmpegExited = true;
     ffmpegExitCode = code ?? (signal ? -1 : 0);
 
-    if (status === 'cancelled') {
+    if (status === 'cancelled' || status === 'completed') {
       return;
     }
 
     if (ffmpegExitCode !== 0) {
+      // If FFmpeg already transcoded substantial audio and exited on a trailing container warning,
+      // treat as natural completion so end-of-track and Loop never break.
+      if (pcmBytes >= MIN_SUBSTANTIAL_PCM_BYTES * 2) {
+        ffmpegExitCode = 0;
+        completeSessionNaturally();
+        return;
+      }
+
       recordFailure(
         new StreamExtractionError(
           `ffmpeg exited with code ${ffmpegExitCode}: ${formatBoundedStderr(ffmpegStderr) || 'no stderr'}`,
@@ -807,12 +1093,7 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
         })
       );
     } else {
-      status = 'completed';
-      if (!pcmStream.writableEnded && !pcmStream.destroyed) {
-        pcmStream.end();
-      }
-      events.emit('completed', { sessionId, pcmBytes, ytdlpBytes });
-      void cleanup('completed');
+      completeSessionNaturally();
     }
   });
 

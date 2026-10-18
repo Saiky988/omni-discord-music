@@ -28,6 +28,20 @@ import {
 export const VALID_LOOP_MODES = Object.freeze(['off', 'track', 'queue']);
 export const VALID_BASSBOOST_LEVELS = Object.freeze(Object.keys(BASSBOOST_PRESETS));
 
+const MAX_HANDLED_SESSION_IDS = 200;
+const MIN_COMPLETED_PCM_BYTES = 48000 * 2 * 2 * 5; // 5 seconds of 48kHz stereo PCM
+
+function addBoundedSessionId(set, sessionId) {
+  if (!sessionId) return;
+  if (set.size >= MAX_HANDLED_SESSION_IDS) {
+    const oldest = set.values().next().value;
+    if (oldest !== undefined) {
+      set.delete(oldest);
+    }
+  }
+  set.add(sessionId);
+}
+
 /**
  * Per-guild isolated queue and playback lifecycle manager.
  */
@@ -142,6 +156,7 @@ export class QueueManager {
       trackPositionBaseSec: 0,
       trackStartedAtMs: null,
       idleTimer: null,
+      emptyChannelTimer: null,
       state: 'idle',
       consecutiveFailures: 0,
       reconnectAttempts: 0,
@@ -161,10 +176,6 @@ export class QueueManager {
     return queue;
   }
 
-  /**
-   * Compute estimated elapsed playback position in seconds for the current track
-   * so mid-song filter toggles (bassboost, nightcore, speed) resume smoothly.
-   */
   /**
    * Just-In-Time (Lazy) resolution: resolves a metadata-only track into a playable
    * stream URL right before playback (or when prefetched as the next upcoming track).
@@ -231,19 +242,55 @@ export class QueueManager {
     }
   }
 
+  getCurrentTrackRawElapsedSeconds(queue) {
+    if (!queue || !queue.currentTrack) {
+      return 0;
+    }
+    let elapsed = queue.trackPositionBaseSec || 0;
+    if ((queue.state === 'playing' || queue.state === 'buffering') && queue.trackStartedAtMs) {
+      const rate = (queue.filters?.nightcore ? 1.25 : 1.0) * (queue.filters?.speed || 1.0);
+      elapsed += ((Date.now() - queue.trackStartedAtMs) / 1000) * rate;
+    }
+    return Math.max(0, elapsed);
+  }
+
   getCurrentTrackElapsedSeconds(queue) {
     if (!queue || !queue.currentTrack || queue.currentTrack.isLive) {
       return 0;
     }
-    let elapsed = queue.trackPositionBaseSec || 0;
-    if (queue.state === 'playing' && queue.trackStartedAtMs) {
-      const rate = (queue.filters?.nightcore ? 1.25 : 1.0) * (queue.filters?.speed || 1.0);
-      elapsed += ((Date.now() - queue.trackStartedAtMs) / 1000) * rate;
-    }
+    const elapsed = this.getCurrentTrackRawElapsedSeconds(queue);
     if (queue.currentTrack.duration && elapsed >= queue.currentTrack.duration - 2) {
       return 0;
     }
     return Math.max(0, Math.floor(elapsed));
+  }
+
+  /**
+   * Determine if a session has already finished playing naturally (or reached the end of the track)
+   * so late stream teardown / EOF events never falsely trigger "Playback Skipped" or break Loop mode.
+   */
+  hasSessionFinishedNaturally(queue) {
+    const sessionState = queue?.currentSession?.getState?.();
+    if (!sessionState) {
+      return false;
+    }
+    if (sessionState.status === 'completed') {
+      return true;
+    }
+    if (sessionState.ffmpegExitCode === 0 && (sessionState.pcmBytes || 0) > 0) {
+      return true;
+    }
+    const elapsed = this.getCurrentTrackRawElapsedSeconds(queue);
+    const duration = queue?.currentTrack?.duration;
+    if (
+      duration &&
+      duration > 10 &&
+      elapsed >= Math.max(10, duration - 4) &&
+      (sessionState.pcmBytes || 0) >= MIN_COMPLETED_PCM_BYTES
+    ) {
+      return true;
+    }
+    return false;
   }
 
   attachPlayerListeners(queue) {
@@ -288,7 +335,7 @@ export class QueueManager {
         }
 
         const sessionState = queue.currentSession?.getState?.();
-        if (sessionState?.status === 'failed') {
+        if (sessionState?.status === 'failed' && !this.hasSessionFinishedNaturally(queue)) {
           void this.handleSessionFailure(
             queue,
             sessionId,
@@ -306,6 +353,23 @@ export class QueueManager {
         return;
       }
       const sessionId = err?.resource?.metadata?.sessionId || queue.activeSessionId;
+      if (!sessionId || queue.handledSessionIds.has(sessionId)) {
+        return;
+      }
+
+      // If the stream already completed naturally (e.g. FFmpeg exited 0 and @discordjs/voice
+      // emitted a late stream close error on the final frame), treat as natural completion
+      // so Loop: Track / Loop: Queue and queue progression never fail!
+      if (this.hasSessionFinishedNaturally(queue)) {
+        this.logger.debug('Treating late AudioPlayer error at end-of-stream as natural completion', {
+          guildId,
+          sessionId,
+          error: err.message
+        });
+        void this.handleNaturalTrackCompletion(queue, sessionId);
+        return;
+      }
+
       this.logger.warn('AudioPlayer emitted error', {
         guildId,
         sessionId,
@@ -517,6 +581,7 @@ export class QueueManager {
     });
 
     this.clearIdleTimer(queue);
+    this.clearEmptyChannelTimer(queue);
 
     const maxQueueSize = this.config.MAX_QUEUE_SIZE || 500;
     const isCurrentlyIdle =
@@ -639,7 +704,7 @@ export class QueueManager {
     if (queue.currentSession) {
       const prevSession = queue.currentSession;
       if (prevSession.sessionId) {
-        queue.handledSessionIds.add(prevSession.sessionId);
+        addBoundedSessionId(queue.handledSessionIds, prevSession.sessionId);
       }
       queue.currentSession = null;
       await prevSession.cleanup('replaced');
@@ -691,8 +756,9 @@ export class QueueManager {
         volume: queue.volume,
         source: track.source,
         webpageUrl: track.webpageUrl,
+        isLive: Boolean(track.isLive),
         directFfmpeg: useDirectFfmpeg,
-         ...(hasActiveFilters ? { filters: { ...queue.filters } } : {}),
+        ...(hasActiveFilters ? { filters: { ...queue.filters } } : {}),
         ...(seekSeconds > 0 ? { seekSeconds } : {}),
         metadata: {
           guildId: queue.guildId,
@@ -715,6 +781,10 @@ export class QueueManager {
 
     streamSession.events?.once?.('failed', (err) => {
       if (queue.activeSessionId !== sessionId || queue.handledSessionIds.has(sessionId)) {
+        return;
+      }
+      if (this.hasSessionFinishedNaturally(queue)) {
+        void this.handleNaturalTrackCompletion(queue, sessionId);
         return;
       }
       void this.handleSessionFailure(queue, sessionId, err);
@@ -745,7 +815,6 @@ export class QueueManager {
 
     let nextLevel;
     if (rawLevel === null || rawLevel === undefined || String(rawLevel).trim() === '') {
-      // Toggle between 'high' and 'off' when invoked without arguments
       nextLevel = queue.filters.bassboost === 'off' ? 'high' : 'off';
     } else {
       const normalized = String(rawLevel).trim().toLowerCase();
@@ -872,7 +941,7 @@ export class QueueManager {
       return;
     }
 
-    queue.handledSessionIds.add(sessionId);
+    addBoundedSessionId(queue.handledSessionIds, sessionId);
     queue.consecutiveFailures = 0;
 
     const finishedTrack = queue.currentTrack;
@@ -898,8 +967,14 @@ export class QueueManager {
       return;
     }
 
+    // Double-check if the track actually finished playing naturally before this error fired
+    if (this.hasSessionFinishedNaturally(queue)) {
+      await this.handleNaturalTrackCompletion(queue, sessionId);
+      return;
+    }
+
     if (sessionId) {
-      queue.handledSessionIds.add(sessionId);
+      addBoundedSessionId(queue.handledSessionIds, sessionId);
     }
 
     const failedTrack = queue.currentTrack;
@@ -963,7 +1038,7 @@ export class QueueManager {
 
     if (reason === 'natural') {
       if (queue.loopMode === 'track' && finishedTrack) {
-        nextTrack = finishedTrack;
+        nextTrack = { ...finishedTrack };
       } else if (queue.loopMode === 'queue' && finishedTrack) {
         queue.tracks.push({ ...finishedTrack });
         nextTrack = queue.tracks.shift() || null;
@@ -985,7 +1060,7 @@ export class QueueManager {
     }
 
     await this.startTrackPlayback(queue, nextTrack, {
-      announce: reason === 'natural'
+      announce: reason === 'natural' && queue.loopMode !== 'track'
     });
 
     return nextTrack;
@@ -1059,7 +1134,7 @@ export class QueueManager {
     const skippedTrack = { ...queue.currentTrack };
     const sessionId = queue.activeSessionId;
     if (sessionId) {
-      queue.handledSessionIds.add(sessionId);
+      addBoundedSessionId(queue.handledSessionIds, sessionId);
     }
 
     const prevSession = queue.currentSession;
@@ -1099,7 +1174,7 @@ export class QueueManager {
     const clearedCount = queue.tracks.length;
     const sessionId = queue.activeSessionId;
     if (sessionId) {
-      queue.handledSessionIds.add(sessionId);
+      addBoundedSessionId(queue.handledSessionIds, sessionId);
     }
 
     queue.tracks = [];
@@ -1203,6 +1278,43 @@ export class QueueManager {
     };
   }
 
+  /**
+   * Called when all non-bot members leave the active voice channel so the bot
+   * automatically disconnects after IDLE_TIMEOUT_MS if nobody returns.
+   */
+  handleVoiceChannelEmpty(guildId) {
+    const queue = this.getQueue(guildId);
+    if (!queue || queue.state === 'destroyed') {
+      return;
+    }
+    this.clearEmptyChannelTimer(queue);
+    const timeoutMs = this.config.IDLE_TIMEOUT_MS ?? 180000;
+    queue.emptyChannelTimer = setTimeout(() => {
+      queue.emptyChannelTimer = null;
+      if (queue.state !== 'destroyed') {
+        this.logger.info('Voice channel remained empty; disconnecting and destroying guild queue', {
+          guildId: queue.guildId,
+          timeoutMs
+        });
+        void this.destroyGuildQueue(queue.guildId, 'voice_channel_empty');
+      }
+    }, timeoutMs);
+    queue.emptyChannelTimer.unref?.();
+  }
+
+  handleVoiceChannelPopulated(guildId) {
+    const queue = this.getQueue(guildId);
+    if (!queue) return;
+    this.clearEmptyChannelTimer(queue);
+  }
+
+  clearEmptyChannelTimer(queue) {
+    if (queue?.emptyChannelTimer) {
+      clearTimeout(queue.emptyChannelTimer);
+      queue.emptyChannelTimer = null;
+    }
+  }
+
   startIdleTimer(queue) {
     if (!queue || queue.state === 'destroyed') {
       return;
@@ -1259,9 +1371,10 @@ export class QueueManager {
     this.queues.delete(key);
     queue.state = 'destroyed';
     this.clearIdleTimer(queue);
+    this.clearEmptyChannelTimer(queue);
 
     if (queue.activeSessionId) {
-      queue.handledSessionIds.add(queue.activeSessionId);
+      addBoundedSessionId(queue.handledSessionIds, queue.activeSessionId);
     }
 
     queue.tracks = [];

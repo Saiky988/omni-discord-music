@@ -1,16 +1,24 @@
+import dns from 'node:dns';
+dns.setDefaultResultOrder?.('ipv4first');
 import { fileURLToPath } from 'node:url';
 import {
   Client,
   ActivityType,
   GatewayIntentBits,
   Events,
-  generateDependencyReport
+  REST,
+  Routes,
+  generateDependencyReport,
+  isNativeDiscordSdkInstalled
 } from './utils/discordSdk.js';
 import { loadConfig, getSafeConfigSummary } from './config.js';
 import { Logger } from './utils/logger.js';
 import { SourceResolver } from './services/resolver.js';
 import { QueueManager } from './services/queueManager.js';
-import { createCommandHandler } from './commands/index.js';
+import {
+  createCommandHandler,
+  getSerializedSlashCommands
+} from './commands/index.js';
 
 /**
  * Create and wire the Omni Discord Music bot application instance.
@@ -74,7 +82,14 @@ export function createBotApplication(options = {}) {
 
   let isShuttingDown = false;
 
-  client.once(Events.ClientReady, (readyClient) => {
+  // Guard against duplicate listener attachment if a shared client instance is passed
+  client.removeAllListeners?.(Events.ClientReady);
+  client.removeAllListeners?.(Events.InteractionCreate);
+  client.removeAllListeners?.(Events.MessageCreate);
+  client.removeAllListeners?.(Events.VoiceStateUpdate);
+  client.removeAllListeners?.('guildDelete');
+
+  client.once(Events.ClientReady, async (readyClient) => {
     const botUser = readyClient?.user || client.user;
     try {
       botUser?.setActivity?.(cfg.BOT_STATUS || 'n!help', {
@@ -83,6 +98,7 @@ export function createBotApplication(options = {}) {
     } catch (err) {
       log.debug('Failed to set bot activity status', { error: err.message });
     }
+
     const depReport = typeof generateDependencyReport === 'function' ? generateDependencyReport() : '';
     const hasDaveSupport =
       depReport.includes('@snazzah/davey') && !depReport.includes('@snazzah/davey: not found');
@@ -102,6 +118,49 @@ export function createBotApplication(options = {}) {
     } else if (cfg.LOG_LEVEL === 'debug' && depReport) {
       log.debug('Voice dependency report', { dependencyReport: depReport });
     }
+
+    // Automatically synchronize Global commands and wipe any Guild-level duplicate slash commands
+    // on startup so servers never see 2x duplicate commands and Top.gg servers always have commands!
+    if (isNativeDiscordSdkInstalled && cfg.DISCORD_TOKEN && cfg.DISCORD_CLIENT_ID) {
+      void (async () => {
+        try {
+          const rest = new REST({ version: '10' }).setToken(cfg.DISCORD_TOKEN);
+          const payloads = getSerializedSlashCommands();
+
+          await rest.put(Routes.applicationCommands(cfg.DISCORD_CLIENT_ID), {
+            body: payloads
+          });
+
+          const guildIdsToClean = new Set();
+          if (cfg.DISCORD_GUILD_ID) {
+            guildIdsToClean.add(cfg.DISCORD_GUILD_ID);
+          }
+          const cachedGuilds = readyClient?.guilds?.cache || client.guilds?.cache;
+          if (cachedGuilds && typeof cachedGuilds.keys === 'function') {
+            for (const gId of cachedGuilds.keys()) {
+              guildIdsToClean.add(gId);
+            }
+          }
+
+          for (const gId of guildIdsToClean) {
+            await rest
+              .put(Routes.applicationGuildCommands(cfg.DISCORD_CLIENT_ID, gId), {
+                body: []
+              })
+              .catch(() => {});
+          }
+
+          log.info('Synchronized global slash commands and cleared duplicate guild-scoped commands', {
+            globalCommands: payloads.length,
+            cleanedGuilds: guildIdsToClean.size
+          });
+        } catch (err) {
+          log.warn('Automatic slash command deduplication on startup encountered an error', {
+            error: err.message
+          });
+        }
+      })();
+    }
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
@@ -120,15 +179,56 @@ export function createBotApplication(options = {}) {
 
   client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     const botId = client.user?.id;
-    if (!botId || oldState?.id !== botId) {
+    const guildId = oldState?.guild?.id || newState?.guild?.id;
+    if (!guildId) {
       return;
     }
-    const guildId = oldState.guild?.id;
-    if (guildId && oldState.channelId && !newState?.channelId) {
-      log.info('Bot was disconnected from voice channel; cleaning up guild queue', {
-        guildId
-      });
-      await queueManager.destroyGuildQueue(guildId, 'bot_kicked_from_voice');
+
+    // 1. Handle bot's own voice state changes
+    if (botId && oldState?.id === botId) {
+      if (oldState.channelId && !newState?.channelId) {
+        log.info('Bot was disconnected from voice channel; cleaning up guild queue', {
+          guildId
+        });
+        await queueManager.destroyGuildQueue(guildId, 'bot_kicked_from_voice');
+        return;
+      }
+      if (newState?.channelId && oldState.channelId !== newState.channelId) {
+        const queue = queueManager.getQueue(guildId);
+        if (queue) {
+          queue.voiceChannelId = newState.channelId;
+        }
+      }
+    }
+
+    // 2. Top.gg Multi-Server Safeguard: check if the bot's active voice channel became empty of humans
+    const queue = queueManager.getQueue(guildId);
+    if (!queue || !queue.voiceChannelId) {
+      return;
+    }
+
+    const relevantChannel =
+      oldState?.channelId === queue.voiceChannelId
+        ? oldState.channel
+        : newState?.channelId === queue.voiceChannelId
+          ? newState.channel
+          : null;
+
+    if (relevantChannel?.members && typeof relevantChannel.members.filter === 'function') {
+      const humanCount = relevantChannel.members.filter((m) => !m.user?.bot).size ?? 0;
+      if (humanCount === 0) {
+        queueManager.handleVoiceChannelEmpty(guildId);
+      } else {
+        queueManager.handleVoiceChannelPopulated(guildId);
+      }
+    }
+  });
+
+  // Top.gg Multi-Server Safeguard: clean up resources immediately if the bot is removed from a server
+  client.on('guildDelete', async (guild) => {
+    if (guild?.id) {
+      log.info('Bot removed from guild; cleaning up queue', { guildId: guild.id });
+      await queueManager.destroyGuildQueue(guild.id, 'guild_removed');
     }
   });
 
@@ -213,12 +313,12 @@ if (isMainModule) {
   process.once('SIGINT', () => void handleSignal('SIGINT', 0));
   process.once('SIGTERM', () => void handleSignal('SIGTERM', 0));
 
+  // Log unhandled rejections without crashing the entire multi-guild Top.gg bot
   process.on('unhandledRejection', (reason) => {
     const err = reason instanceof Error ? reason : new Error(String(reason));
-    app.logger.error('Unhandled Promise Rejection — initiating controlled shutdown', {
+    app.logger.error('Unhandled Promise Rejection caught', {
       error: err.message
     });
-    void handleSignal('unhandledRejection', 1);
   });
 
   process.on('uncaughtException', (err) => {

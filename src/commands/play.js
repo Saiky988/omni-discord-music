@@ -33,6 +33,9 @@ export const requiresVoice = true;
 export const requiresSameVoice = false;
 export const defer = true;
 
+// Prevent duplicate concurrent file-upload collectors for the same user in the same guild
+const activeFileWaiters = new Map();
+
 function extractFirstAttachment(attachments) {
   if (!attachments) return null;
   if (typeof attachments.first === 'function') {
@@ -47,32 +50,71 @@ function extractFirstAttachment(attachments) {
   return null;
 }
 
+function isCommandPrefixMessage(content, configuredPrefix = '!') {
+  if (!content) return false;
+  const trimmed = String(content).trim();
+  return (
+    (configuredPrefix && trimmed.startsWith(configuredPrefix)) ||
+    trimmed.toLowerCase().startsWith('n!')
+  );
+}
+
 /**
  * Wait up to timeoutMs for the requesting user to upload an attachment or type "cancel" in the channel.
  */
-async function waitForUserFileMessage({ textChannel, message, userId, timeoutMs = 60000 }) {
+async function waitForUserFileMessage({
+  guildId,
+  textChannel,
+  message,
+  userId,
+  configuredPrefix = '!',
+  timeoutMs = 60000
+}) {
   if (!textChannel) {
     return { status: 'timeout', attachment: null, followUpMessage: null };
   }
 
+  const waiterKey = `${guildId || 'guild'}:${userId || 'user'}`;
+  const existingCancel = activeFileWaiters.get(waiterKey);
+  if (typeof existingCancel === 'function') {
+    existingCancel();
+  }
+
   // 1. Prefer Discord.js TextChannel.awaitMessages when available
   if (typeof textChannel.awaitMessages === 'function') {
+    let cancelledExternally = false;
+    activeFileWaiters.set(waiterKey, () => {
+      cancelledExternally = true;
+    });
+
     try {
       const collected = await textChannel.awaitMessages({
         filter: (m) => {
+          if (cancelledExternally) return false;
           if (!m || m.author?.bot || (userId && m.author?.id !== userId)) {
             return false;
           }
-          const txt = String(m.content || '').trim().toLowerCase();
-          if (txt === 'cancel') {
+          const txt = String(m.content || '').trim();
+          if (txt.toLowerCase() === 'cancel') {
+            m._handledByFileWaiter = true;
             return true;
           }
-          return Boolean(extractFirstAttachment(m.attachments));
+          // Ignore messages starting with ! or n! so handlePrefixMessage handles them without duplication
+          if (isCommandPrefixMessage(txt, configuredPrefix)) {
+            return false;
+          }
+          const hasAtt = Boolean(extractFirstAttachment(m.attachments));
+          if (hasAtt) {
+            m._handledByFileWaiter = true;
+          }
+          return hasAtt;
         },
         max: 1,
         time: timeoutMs,
         errors: ['time']
       });
+
+      activeFileWaiters.delete(waiterKey);
 
       const firstMsg = typeof collected?.first === 'function'
         ? collected.first()
@@ -93,6 +135,7 @@ async function waitForUserFileMessage({ textChannel, message, userId, timeoutMs 
         followUpMessage: firstMsg
       };
     } catch {
+      activeFileWaiters.delete(waiterKey);
       return { status: 'timeout', attachment: null, followUpMessage: null };
     }
   }
@@ -110,20 +153,31 @@ async function waitForUserFileMessage({ textChannel, message, userId, timeoutMs 
     }, timeoutMs);
     timer.unref?.();
 
+    activeFileWaiters.set(waiterKey, () => {
+      cleanup();
+      resolve({ status: 'cancelled', attachment: null, followUpMessage: null });
+    });
+
     const onMessage = (m) => {
       if (!m || m.author?.bot) return;
       if (textChannel.id && m.channelId && m.channelId !== textChannel.id) return;
       if (userId && m.author?.id !== userId) return;
 
-      const txt = String(m.content || '').trim().toLowerCase();
-      if (txt === 'cancel') {
+      const txt = String(m.content || '').trim();
+      if (txt.toLowerCase() === 'cancel') {
+        m._handledByFileWaiter = true;
         cleanup();
         resolve({ status: 'cancelled', attachment: null, followUpMessage: m });
         return;
       }
 
+      if (isCommandPrefixMessage(txt, configuredPrefix)) {
+        return;
+      }
+
       const att = extractFirstAttachment(m.attachments);
       if (att) {
+        m._handledByFileWaiter = true;
         cleanup();
         resolve({ status: 'received', attachment: att, followUpMessage: m });
       }
@@ -131,6 +185,7 @@ async function waitForUserFileMessage({ textChannel, message, userId, timeoutMs 
 
     function cleanup() {
       clearTimeout(timer);
+      activeFileWaiters.delete(waiterKey);
       emitter.off?.('messageCreate', onMessage);
       emitter.removeListener?.('messageCreate', onMessage);
     }
@@ -206,9 +261,11 @@ export async function execute(context) {
     }
 
     const waitResult = await waitForUserFileMessage({
+      guildId,
       textChannel: textChannel || message?.channel,
       message,
       userId: userId || message?.author?.id,
+      configuredPrefix: runtimeConfig?.PREFIX || '!',
       timeoutMs: waitSeconds * 1000
     });
 

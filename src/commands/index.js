@@ -56,6 +56,26 @@ export const ALL_COMMAND_MODULES = Object.freeze([
   helpCommand
 ]);
 
+const MAX_DEDUP_EVENT_IDS = 2000;
+
+function recordUniqueEventId(seenSet, eventId) {
+  if (!eventId) {
+    return true;
+  }
+  const key = String(eventId);
+  if (seenSet.has(key)) {
+    return false;
+  }
+  if (seenSet.size >= MAX_DEDUP_EVENT_IDS) {
+    const oldest = seenSet.values().next().value;
+    if (oldest !== undefined) {
+      seenSet.delete(oldest);
+    }
+  }
+  seenSet.add(key);
+  return true;
+}
+
 export function validateCommandModule(mod) {
   if (!mod || typeof mod !== 'object') {
     throw new Error('Command module must be an object.');
@@ -233,6 +253,8 @@ export function createCommandHandler(options = {}) {
   const resolver = options.resolver || defaultResolver;
   const runtimeConfig = options.config || config;
   const log = (options.logger || defaultLogger).child?.('commands') || defaultLogger;
+  const seenInteractionIds = new Set();
+  const seenMessageIds = new Set();
 
   function resolveCommand(nameOrAlias) {
     if (!nameOrAlias) return null;
@@ -245,6 +267,10 @@ export function createCommandHandler(options = {}) {
    */
   async function handleButtonInteraction(interaction) {
     if (!interaction || typeof interaction.customId !== 'string' || !interaction.customId.startsWith('music:')) {
+      return null;
+    }
+
+    if (interaction.id && !recordUniqueEventId(seenInteractionIds, `btn:${interaction.id}`)) {
       return null;
     }
 
@@ -365,6 +391,10 @@ export function createCommandHandler(options = {}) {
       return null;
     }
 
+    if (interaction.id && !recordUniqueEventId(seenInteractionIds, `slash:${interaction.id}`)) {
+      return null;
+    }
+
     const command = resolveCommand(interaction.commandName);
     if (!command) {
       const unknownPayload = {
@@ -476,10 +506,14 @@ export function createCommandHandler(options = {}) {
   }
 
   /**
-   * Handle a prefix message command (e.g., !play <query>).
+   * Handle a prefix message command (e.g., !play <query> or n!play <query>).
    */
   async function handlePrefixMessage(message) {
-    if (!message || message.author?.bot || !message.content) {
+    if (!message || message.author?.bot || !message.content || message._handledByFileWaiter) {
+      return null;
+    }
+
+    if (message.id && !recordUniqueEventId(seenMessageIds, `msg:${message.id}`)) {
       return null;
     }
 
