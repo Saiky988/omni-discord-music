@@ -422,6 +422,8 @@ export function createCommandHandler(options = {}) {
       textChannel: interaction.channel || null,
       adapterCreator: guild.voiceAdapterCreator || null,
       requesterTag: interaction.user?.tag || interaction.user?.username || 'Discord User',
+      userId: interaction.user?.id || null,
+      interaction,
       options: interaction.options,
       args: [],
       resolver,
@@ -537,6 +539,8 @@ export function createCommandHandler(options = {}) {
       textChannel: message.channel || null,
       adapterCreator: guild.voiceAdapterCreator || null,
       requesterTag: message.author?.tag || message.author?.username || 'Discord User',
+      userId: message.author?.id || null,
+      message,
       options: null,
       args,
       resolver,
@@ -561,6 +565,10 @@ export function createCommandHandler(options = {}) {
         error: err.message
       });
       response = mapErrorToEmbedResponse(err);
+    }
+
+    if (response?.alreadyReplied) {
+      return response;
     }
 
     try {

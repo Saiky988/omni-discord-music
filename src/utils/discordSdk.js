@@ -178,6 +178,12 @@ class FallbackSlashCommandBuilder {
     this.options.push(opt);
     return this;
   }
+  addAttachmentOption(fn) {
+    const opt = new OptionBuilderBase(11);
+    fn(opt);
+    this.options.push(opt);
+    return this;
+  }
   toJSON() {
     if (!this.name || !this.description) {
       throw new Error('SlashCommandBuilder requires both name and description before serialization.');

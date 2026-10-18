@@ -1,3 +1,5 @@
+import dns from 'node:dns';
+dns.setDefaultResultOrder?.('ipv4first');
 import { spawn as defaultSpawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Readable } from 'node:stream';
@@ -378,17 +380,21 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
   const directFfmpeg = Boolean(options.directFfmpeg);
   const log = (options.logger || defaultLogger).child?.('streamer') || defaultLogger;
 
-  // For live TikTok playback, try opening a fresh HTTP stream via TikWM -> Node fetch -> ffmpeg pipe:0
-  const isLiveTikTok =
+  // For live TikTok OR direct media / Discord CDN attachments, stream via Node IPv4 fetch -> ffmpeg pipe:0
+  // so FFmpeg never hangs on broken IPv6 routes or fails probing MP4 video containers!
+  const shouldOpenNodeHttpPipe =
     spawnFn === defaultSpawn &&
-    !directFfmpeg &&
-    (options.source === 'tiktok' ||
+    (directFfmpeg ||
+      options.source === 'tiktok' ||
+      options.source === 'direct_media' ||
       validatedTarget.includes('tiktok.com') ||
       validatedTarget.includes('tikwm.com') ||
-      validatedTarget.includes('tiktokcdn.com'));
+      validatedTarget.includes('tiktokcdn.com') ||
+      validatedTarget.includes('cdn.discordapp.com') ||
+      validatedTarget.includes('media.discordapp.net'));
 
   let tiktokHttpStream = null;
-  if (isLiveTikTok) {
+  if (shouldOpenNodeHttpPipe) {
     tiktokHttpStream = await openTikTokHttpStream(
       options.webpageUrl || validatedTarget,
       validatedTarget,
@@ -397,14 +403,16 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
   }
 
   const useHttpStreamPipe = Boolean(tiktokHttpStream);
-  const ytdlpArgs = directFfmpeg || useHttpStreamPipe ? [] : buildYtdlpArgs(validatedTarget);
+  const effectiveDirectFfmpeg = directFfmpeg && !useHttpStreamPipe;
+  const ytdlpArgs = effectiveDirectFfmpeg || useHttpStreamPipe ? [] : buildYtdlpArgs(validatedTarget);
   const ffmpegArgs =
-    options.filters || options.seekSeconds
-      ? buildFfmpegArgs(directFfmpeg ? validatedTarget : null, {
+    options.filters || options.seekSeconds || useHttpStreamPipe
+      ? buildFfmpegArgs(effectiveDirectFfmpeg ? validatedTarget : null, {
           filters: options.filters,
-          seekSeconds: options.seekSeconds
+          seekSeconds: options.seekSeconds,
+          isContainerPipe: useHttpStreamPipe
         })
-      : buildFfmpegArgs(directFfmpeg ? validatedTarget : null);
+      : buildFfmpegArgs(effectiveDirectFfmpeg ? validatedTarget : null);
 
   const events = new EventEmitter();
   const ytdlpStderr = { chunks: [], bytes: 0 };
@@ -419,9 +427,9 @@ export async function createAudioStream(targetQueryOrUrl, options = {}) {
   let failureError = null;
   let ytdlpBytes = 0;
   let pcmBytes = 0;
-  let ytdlpExited = directFfmpeg || useHttpStreamPipe;
+  let ytdlpExited = effectiveDirectFfmpeg || useHttpStreamPipe;
   let ffmpegExited = false;
-  let ytdlpExitCode = directFfmpeg || useHttpStreamPipe ? 0 : null;
+  let ytdlpExitCode = effectiveDirectFfmpeg || useHttpStreamPipe ? 0 : null;
   let ffmpegExitCode = null;
   let cleanupPromise = null;
 

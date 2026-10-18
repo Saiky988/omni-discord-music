@@ -413,3 +413,12 @@ export function buildConnectionRecoveryFailureEmbed(
 ) {
   return buildErrorEmbed('Voice Disconnected', detail);
 }
+
+export function buildFileUploadPromptEmbed(timeoutSeconds = 60) {
+  return new EmbedBuilder()
+    .setColor(EmbedColors.PRIMARY)
+    .setAuthor({ name: 'Upload Audio File' })
+    .setDescription(
+      `Please upload an audio or video file (.mp3, .m4a, .wav, .flac, .ogg, .mp4) from your device in this channel within **${timeoutSeconds} seconds**.\nType **cancel** to abort.`
+    );
+}

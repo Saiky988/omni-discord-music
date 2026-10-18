@@ -1,3 +1,5 @@
+import dns from 'node:dns';
+dns.setDefaultResultOrder?.('ipv4first');
 import { spawn as defaultSpawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -894,6 +896,78 @@ export class SourceResolver {
     return this.resolveExtractorSingle(parsedUrl, platform, { requestedBy, lazy });
   }
 
+  /**
+   * Resolve a Discord message/interaction Attachment object uploaded from a user's device.
+   */
+  resolveAttachment(attachment, { requestedBy = null } = {}) {
+    if (!attachment || typeof attachment !== 'object') {
+      throw new InvalidInputError(
+        'Missing attachment object.',
+        'Please attach a valid audio or video file (.mp3, .m4a, .wav, .flac, .ogg, .opus, .mp4, .webm).'
+      );
+    }
+
+    const rawUrl = attachment.url || attachment.proxyURL;
+    if (!rawUrl || typeof rawUrl !== 'string') {
+      throw new InvalidInputError(
+        'Attachment is missing a valid download URL.',
+        'Could not read the uploaded file URL from Discord.'
+      );
+    }
+
+    const parsedUrl = parseAndValidateUrl(rawUrl, {
+      allowHttp: Boolean(this.config.ALLOW_HTTP_MEDIA)
+    });
+
+    const rawName = String(attachment.name || path.basename(parsedUrl.pathname) || 'Uploaded Audio').trim();
+    const lowerName = rawName.toLowerCase();
+    const contentType = String(attachment.contentType || '').toLowerCase();
+
+    const matchedExt = DIRECT_MEDIA_EXTENSIONS.find((ext) => lowerName.endsWith(ext)) ||
+      (['.mov', '.mkv', '.avi'].find((ext) => lowerName.endsWith(ext)) || '');
+
+    const isAudioOrVideoContent =
+      Boolean(matchedExt) ||
+      contentType.startsWith('audio/') ||
+      contentType.startsWith('video/') ||
+      contentType.includes('ogg') ||
+      contentType.includes('octet-stream');
+
+    if (!isAudioOrVideoContent) {
+      throw new UnsupportedMediaError(
+        `Unsupported uploaded file type: ${rawName} (${contentType || 'unknown'})`,
+        'Unsupported file format. Please upload an audio or video file (.mp3, .m4a, .wav, .flac, .ogg, .opus, .mp4, .webm).'
+      );
+    }
+
+    let cleanTitle = matchedExt ? rawName.slice(0, -matchedExt.length) : rawName;
+    cleanTitle = cleanTitle
+      .replace(/^snapvideo--/i, '')
+      .replace(/[_-]+/g, ' ')
+      .trim() || rawName;
+
+    const duration =
+      Number.isFinite(Number(attachment.duration)) && Number(attachment.duration) > 0
+        ? Math.round(Number(attachment.duration))
+        : null;
+
+    this.assertDurationAllowed(duration, false);
+
+    const track = createNormalizedTrack({
+      title: cleanTitle,
+      artist: 'Local File',
+      query: parsedUrl.toString(),
+      source: 'direct_media',
+      thumbnail: null,
+      duration,
+      webpageUrl: parsedUrl.toString(),
+      isLive: false,
+      requestedBy
+    });
+
+    return wrapSingleTrackResult(track);
+  }
+
   async resolveDirectMedia(parsedUrl, { requestedBy = null } = {}) {
     const validation = await this.directMediaValidator(parsedUrl, {
       allowHttp: Boolean(this.config.ALLOW_HTTP_MEDIA)
@@ -902,7 +976,8 @@ export class SourceResolver {
     const finalUrl = validation.finalUrl || parsedUrl.toString();
     const baseName = decodeURIComponent(path.basename(new URL(finalUrl).pathname)) || 'Direct Audio Stream';
     const ext = DIRECT_MEDIA_EXTENSIONS.find((e) => baseName.toLowerCase().endsWith(e)) || '';
-    const cleanTitle = ext ? baseName.slice(0, -ext.length) || baseName : baseName;
+    const rawTitle = ext ? baseName.slice(0, -ext.length) || baseName : baseName;
+    const cleanTitle = rawTitle.replace(/^snapvideo--/i, '').trim() || rawTitle;
 
     const track = createNormalizedTrack({
       title: cleanTitle,

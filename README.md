@@ -1,74 +1,162 @@
-# Omni Discord Music (`omni-discord-music`)
+# Omni Discord Music
 
-![Node.js](https://img.shields.io/badge/node-%3E%3D18.18%20(20%20LTS%20Recommended)-339933?logo=node.js&logoColor=white)
-![Discord.js](https://img.shields.io/badge/discord.js-v14-5865F2?logo=discord&logoColor=white)
-![Module System](https://img.shields.io/badge/module-ESM-F7DF1E?logo=javascript&logoColor=black)
-![License](https://img.shields.io/badge/license-MIT-blue)
+Production-grade, open-source Discord music bot built with **Node.js 22+**, **discord.js v14**, **@discordjs/voice v0.19+ (DAVE E2EE ready)**, **yt-dlp**, and **FFmpeg**.
 
-**Omni Discord Music** (`omni-discord-music`) is a production-grade, open-source, multi-guild Discord music bot built with Node.js (ESM), `discord.js` v14, `@discordjs/voice`, `play-dl`, `yt-dlp`, and `ffmpeg`.
-
-It provides deterministic per-guild audio queues, dual command interfaces (`/slash` and `!prefix` sharing a single execution pipeline), zero-buffering raw PCM audio streaming (`s16le`, 48 kHz, stereo), strict SSRF and command-injection protections, and idempotent child-process lifecycle management.
+Designed for instant response times (**Lazy Resolution**), studio-grade 48kHz PCM audio with real-time filter hot-reloading (**Bassboost**, **Nightcore**, **Speed**), multi-platform media extraction, and direct device file playback.
 
 ---
 
-## Feature Matrix
+## 1. Key Features
 
-| Capability | Implementation Details |
-| :--- | :--- |
-| **Dual Command Interfaces** | Discord Slash Commands (`/play`, `/skip`, `/queue`, etc.) and Prefix Commands (`!play`, `!skip`, `!queue`, etc.) routed through one unified handler and permission gate |
-| **Multi-Guild Isolation** | Independent `GuildQueue`, `AudioPlayer`, `VoiceConnection`, active `sessionId`, loop state, volume state, and idle disconnect timer per guild |
-| **Zero-Buffering PCM Pipeline** | Native `child_process.spawn` (`shell: false`) piping `yt-dlp` `stdout` into `ffmpeg` `stdin` (`s16le`, `48000` Hz, `2` channels) into `@discordjs/voice` `StreamType.Raw` with backpressure propagation |
-| **Multi-Platform Resolution** | YouTube, YouTube Music, Spotify (metadata to playable search fallback), Apple Music (metadata to playable search fallback), SoundCloud, TikTok, Douyin, Facebook, Instagram, and validated direct media URLs |
-| **Loop & Queue Modes** | `off` (FIFO), `track` (replay active track without queue duplication), and `queue` (append naturally finished tracks to the tail in FIFO order) |
-| **Process & Stream Safety** | Session-tagged pipelines, idempotent cleanup, `SIGTERM` to `SIGKILL` escalation timeouts, and protection against stale process events corrupting subsequent tracks |
-| **Security & SSRF Protection** | Strict hostname boundary checks, protocol filtering, IPv4/IPv6 loopback/private/link-local/CGNAT/IMDS blocking, obfuscated IP rejection, redirect hop revalidation, and CLI flag-injection prevention |
-| **Structured Observability** | JSON structured logger with severity filtering (`debug`, `info`, `warn`, `error`, `silent`) and automatic token/cookie/signed-URL redaction |
+- **Dual Command Interface & Interactive Controls**
+  - Full parity between Discord Slash Commands (`/play`, `/bassboost`, `/help`) and Prefix Commands (`n!play`, `n!bb`, `n!help` or `!play`).
+  - Clean, icon-free, mobile-optimized embeds with interactive player buttons (**Pause / Resume**, **Skip**, **Loop: Off / Track / Queue**, **Queue**, **Stop**).
+  - Automatic bot presence status set to **Listening to n!help** on startup (`BOT_STATUS=n!help`).
+
+- **Device Audio/Video File Playback (`/play file` & `n!play file`)**
+  - **Slash Upload (`/play file:<attachment>`)**: Select and upload any audio or video file (`.mp3`, `.m4a`, `.wav`, `.flac`, `.ogg`, `.opus`, `.mp4`, `.webm`, `.mov`) directly from your phone or computer.
+  - **Interactive Prefix Upload (`n!play file`)**: Type `n!play file` in chat; the bot replies immediately and waits up to **60 seconds** for you to upload your audio/video file in the channel (type `cancel` to abort).
+  - **Direct Message Attachment (`n!play` + file)**: Attach an audio file directly to the `n!play` message for one-step playback.
+
+- **Lazy Resolution & Instant Embed Reply (~150ms)**
+  - **Metadata-First Fast Path**: When you play a Spotify/Apple Music track, album, or 100-track playlist, or a YouTube/TikTok link, the bot fetches lightweight metadata (`title`, `artist`, `thumbnail`, `duration`) first and replies with the Discord embed **immediately**.
+  - **Just-In-Time Stream Resolution**: Queued tracks remain lightweight metadata objects until right before playback.
+  - **Next-Track Background Prefetch**: While the current track is playing, `QueueManager` automatically pre-resolves **only the immediately upcoming track** (`queue.tracks[0]`) in the background so track transitions are seamless with zero wasted CPU/network work.
+
+- **Studio-Grade 48kHz Audio & Real-Time Filter Hot-Reloading**
+  - **32-Tap `swr` Resampling + Soft Limiter**: Converts audio to 48kHz 16-bit stereo PCM (`s16le`) using a 32-tap linear-interpolation resampler, `+3.5dB` baseline presence boost, and `alimiter` ceiling protection (`0.95`) to eliminate clipping or distortion even at 200% volume.
+  - **Live Mid-Track Filter Switching**: Toggling `/bassboost`, `/nightcore`, or `/speed` automatically calculates the current elapsed playback second (`seekSeconds`) and hot-reloads the FFmpeg filter pipeline at the exact same position in the song.
+  - **IPv4-First Direct Streaming**: Streams TikTok, Discord CDN (`cdn.discordapp.com`), and direct media links via Node.js IPv4 HTTP streams piped into `ffmpeg -i pipe:0`, preventing 4-minute IPv6 connection hangs and Cloudflare/CDN `403 Forbidden` errors.
 
 ---
 
-## Architecture Overview
+## 2. Command Reference
+
+All commands work via Slash (`/command`) and Prefix (`n!command` or `!command`).
+
+### 2.1 Playback & Device File Upload
+| Slash Command | Prefix Command & Shortcuts | Description |
+| :--- | :--- | :--- |
+| `/play query:<text or url>` | `n!play <text or url>`, `n!p` | Play or queue a track/playlist from a search query or URL |
+| `/play file:<attachment>` | `n!play` *(with attached file)* | Upload an audio/video file directly from your device to play |
+| — | `n!play file` | Bot prompts and waits 60s for you to upload an audio/video file |
+
+### 2.2 Playback Controls & Queue
+| Slash Command | Prefix Command & Shortcuts | Description |
+| :--- | :--- | :--- |
+| `/pause` | `n!pause` | Pause the currently playing track |
+| `/resume` | `n!resume` | Resume a paused track |
+| `/skip` | `n!skip`, `n!s` | Skip the current track and play the next track in queue |
+| `/stop` | `n!stop` | Stop playback and clear the server queue |
+| `/queue [page]` | `n!queue [page]`, `n!q` | View the active track and paginated upcoming queue |
+| `/nowplaying` | `n!nowplaying`, `n!np` | Display the active track card and interactive control buttons |
+
+### 2.3 Volume, Loop & Real-Time Audio Effects
+| Slash Command | Prefix Command & Shortcuts | Parameters | Description |
+| :--- | :--- | :--- | :--- |
+| `/volume <level>` | `n!volume`, `n!vol`, `n!v` | `0` – `200` | Adjust server playback volume (default `100%`) |
+| `/loop <mode>` | `n!loop` | `off`, `track`, `queue` | Set repeat mode for the server queue |
+| `/bassboost [level]` | `n!bassboost`, `n!bb`, `n!bass` | `off`, `low`, `medium`, `high`, `extreme` | Boost sub-bass (`60Hz`) and punch (`110Hz`) from `+5dB` to `+17dB` (omit level to toggle) |
+| `/nightcore [mode]` | `n!nightcore`, `n!nc` | `on`, `off` | Toggle 1.25x pitch + tempo Nightcore effect |
+| `/speed <rate>` | `n!speed`, `n!tempo`, `n!rate` | `0.5` – `2.0` (`off` = `1.0x`) | Adjust playback speed between `0.5x` (slowed) and `2.0x` |
+| `/help` | `n!help`, `n!h`, `n!commands` | — | Show the detailed command guide |
+
+---
+
+## 3. Supported Media Sources
+
+1. **YouTube & YouTube Music**: Direct video URLs, YouTube Shorts, YouTube Music links, playlists, and plain-text search queries.
+2. **Spotify**: Track, Album, and Playlist URLs (`open.spotify.com`, `spotify.link`). Uses duration-scored candidate matching (`selectBestSearchCandidate`) to ensure exact official audio matches.
+3. **Apple Music**: Track, Album, and Playlist URLs (`music.apple.com`).
+4. **SoundCloud**: Track URLs, Sets/Playlists, mobile share shortlinks (`on.soundcloud.com` auto-extracting the shared single track instead of a 50-track station), and search fallback.
+5. **TikTok & Douyin**: Full URLs and mobile shortlinks (`vt.tiktok.com`, `vm.tiktok.com`) with fresh signed stream extraction at playback time.
+6. **Facebook & Instagram**: Public video and reel URLs containing playable audio tracks.
+7. **Discord CDN & Direct Media Files**: Uploaded device files and direct HTTPS media links (`.mp3`, `.m4a`, `.flac`, `.wav`, `.ogg`, `.opus`, `.aac`, `.mp4`, `.webm`, `.m3u8`).
+
+---
+
+## 4. System Requirements & Installation
+
+### 4.1 Prerequisites
+- **Node.js**: `>= 22.12.0` (Required by `@snazzah/davey` for Discord's mandatory DAVE End-to-End Encrypted voice handshakes).
+- **FFmpeg**: Installed on system `PATH` (`apt install -y ffmpeg`).
+- **yt-dlp**: Latest release installed on system `PATH` (`yt-dlp -U`).
+- **Firewall**: Outbound UDP (ports `50000-65535`) and TCP `443` open for Discord Voice WebRTC/RTP.
+
+### 4.2 Setup & Run
+```bash
+cd /omni-discord-music
+npm install
+cp .env.example .env
+# Edit .env with your DISCORD_TOKEN, DISCORD_CLIENT_ID, and optional DISCORD_GUILD_ID
+npm run deploy-commands
+npm start
+```
+
+---
+
+## 5. Environment Variables (`.env`)
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `DISCORD_TOKEN` | *(Required)* | Discord Bot Token from the Discord Developer Portal |
+| `DISCORD_CLIENT_ID` | *(Required)* | Discord Application Client ID |
+| `DISCORD_GUILD_ID` | *(Optional)* | Server ID for instant guild-scoped slash command deployment |
+| `PREFIX` | `!` | Prefix for text commands (note: `n!` is always accepted alongside `PREFIX`) |
+| `BOT_STATUS` | `n!help` | Activity status displayed on the bot profile (`Listening to n!help`) |
+| `DEFAULT_VOLUME` | `100` | Initial server playback volume percentage |
+| `MAX_VOLUME` | `200` | Maximum allowed volume percentage |
+| `IDLE_TIMEOUT_MS` | `180000` | Disconnect after 3 minutes of inactivity |
+| `MAX_QUEUE_SIZE` | `500` | Maximum tracks allowed per guild queue |
+| `MAX_PLAYLIST_TRACKS` | `100` | Maximum tracks imported from a single playlist |
+| `VOICE_READY_TIMEOUT_MS` | `20000` | Timeout (ms) waiting for Discord Voice `Ready` state |
+| `ALLOW_HTTP_MEDIA` | `false` | Set to `true` only if you need non-TLS `http://` direct media links |
+
+---
+
+## 6. Project Structure
 
 ```text
 omni-discord-music/
-├── .env.example              # Documented environment variable template
-├── .gitignore                # Excludes secrets, node_modules, logs, and temp artifacts
-├── LICENSE                   # MIT License
-├── README.md                 # Complete setup, operational, and security documentation
-├── package.json              # ESM package manifest and scripts
-├── ecosystem.config.js       # PM2 single-instance fork-mode production config
-├── Dockerfile                # Hardened Debian Bookworm Node 20 LTS image with ffmpeg & verified yt-dlp
-├── docker-compose.yml        # Single-service container deployment configuration
+├── .env.example
+├── Dockerfile
+├── docker-compose.yml
+├── package.json
+├── README.md
 ├── src/
-│   ├── config.js             # Startup environment parser, bounds validator, and secret redactor
-│   ├── index.js              # Bot client entrypoint, event wiring, and graceful shutdown
-│   ├── deploy-commands.js    # Guild/Global Discord Slash Command registration script
+│   ├── index.js                # Bot entry point, IPv4-first DNS, DAVE check, n!help status
+│   ├── config.js               # Environment loader & validation
+│   ├── deploy-commands.js      # Slash command registration script
 │   ├── commands/
-│   │   ├── index.js          # Command loader, validator, permission checks, slash & prefix router
-│   │   ├── play.js           # /play and !play
-│   │   ├── pause.js          # /pause and !pause
-│   │   ├── resume.js         # /resume and !resume
-│   │   ├── skip.js           # /skip and !skip
-│   │   ├── stop.js           # /stop and !stop
-│   │   ├── queue.js          # /queue and !queue (paginated)
-│   │   ├── volume.js         # /volume and !volume
-│   │   ├── loop.js           # /loop and !loop
-│   │   ├── nowplaying.js     # /nowplaying and !nowplaying
-│   │   └── help.js           # /help and !help
+│   │   ├── index.js            # Unified command & button router
+│   │   ├── play.js             # /play, !play, /play file:, and interactive n!play file handler
+│   │   ├── pause.js
+│   │   ├── resume.js
+│   │   ├── skip.js
+│   │   ├── stop.js
+│   │   ├── queue.js
+│   │   ├── volume.js
+│   │   ├── loop.js
+│   │   ├── bassboost.js        # /bassboost & n!bb real-time sub-bass filter command
+│   │   ├── nightcore.js        # /nightcore & n!nc 1.25x pitch + tempo command
+│   │   ├── speed.js            # /speed & n!tempo playback rate multiplier command
+│   │   ├── nowplaying.js
+│   │   └── help.js             # Clean, structured command guide without backtick clutter
 │   ├── services/
-│   │   ├── resolver.js       # Source detection, metadata extraction, playlist bounding, and fallback search
-│   │   ├── streamer.js       # yt-dlp -> ffmpeg PCM pipeline and idempotent child-process lifecycle
-│   │   └── queueManager.js   # Per-guild state machine, loop progression, recovery, and idle timers
+│   │   ├── resolver.js         # Multi-platform metadata & Lazy Resolution engine
+│   │   ├── streamer.js         # IPv4 HTTP pipe + yt-dlp -> FFmpeg 48kHz audio filter pipeline
+│   │   └── queueManager.js     # Per-guild state, JIT lazy resolution, next-track prefetch, filter hot-reload
 │   └── utils/
-│       ├── discordSdk.js     # Upstream discord.js / @discordjs/voice / play-dl loader with offline test support
-│       ├── embeds.js         # Standardized Discord embeds and mention/markdown sanitization
-│       ├── errors.js         # Typed application error hierarchy and error codes
-│       ├── logger.js         # Structured JSON logger with secret and query-signature redaction
-│       └── urlSafety.js      # Hostname boundary matcher, SSRF IP/DNS validator, and redirect verifier
+│       ├── discordSdk.js       # Discord.js v14 / @discordjs/voice SDK loader
+│       ├── embeds.js           # Icon-free mobile-friendly embed & button builders
+│       ├── errors.js           # Structured error hierarchy
+│       ├── logger.js           # Structured JSON logger with secret redaction
+│       └── urlSafety.js        # SSRF protection, domain validation & media probing
 └── tests/
-    ├── resolver.test.js      # URL validation, SSRF, hostname spoofing, platform & playlist tests
-    ├── streamer.test.js      # Spawn lifecycle, PCM piping, error codes, EPIPE, and idempotent cleanup tests
-    ├── queueManager.test.js  # Guild isolation, FIFO, loop modes, skip/stop, idle timer, and failure tests
-    └── commands.test.js      # Command loading, slash serialization, config validation, and parity tests
+    ├── commands.test.js
+    ├── queueManager.test.js
+    ├── resolver.test.js
+    └── streamer.test.js
 ```
 
 ### Playback Data Flow

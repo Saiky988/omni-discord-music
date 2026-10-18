@@ -4,20 +4,28 @@ import {
   buildTrackQueuedEmbed,
   buildPlaylistAddedEmbed,
   buildInvalidInputEmbed,
+  buildErrorEmbed,
+  buildFileUploadPromptEmbed,
   buildPlayerControlRow
 } from '../utils/embeds.js';
 
 export const data = new SlashCommandBuilder()
   .setName('play')
-  .setDescription('Play a track or playlist from a URL or search query')
+  .setDescription('Play a song from a search query, URL, or an uploaded audio/video file from your device')
   .setDMPermission(false)
   .addStringOption((option) =>
     option
       .setName('query')
-      .setDescription('Media URL (YouTube, Spotify, Apple Music, SoundCloud, TikTok, etc.) or search query')
-      .setRequired(true)
+      .setDescription('Song title or URL (YouTube, Spotify, Apple Music, SoundCloud, TikTok...)')
+      .setRequired(false)
       .setMinLength(2)
       .setMaxLength(1000)
+  )
+  .addAttachmentOption((option) =>
+    option
+      .setName('file')
+      .setDescription('Upload an audio/video file directly from your device (.mp3, .m4a, .wav, .flac, .ogg, .mp4...)')
+      .setRequired(false)
   );
 
 export const aliases = ['p'];
@@ -25,13 +33,120 @@ export const requiresVoice = true;
 export const requiresSameVoice = false;
 export const defer = true;
 
+function extractFirstAttachment(attachments) {
+  if (!attachments) return null;
+  if (typeof attachments.first === 'function') {
+    return attachments.first() || null;
+  }
+  if (attachments instanceof Map) {
+    return attachments.values().next().value || null;
+  }
+  if (Array.isArray(attachments)) {
+    return attachments[0] || null;
+  }
+  return null;
+}
+
 /**
- * Shared execution handler for /play and !play.
- * Starts playback of the first track immediately and loads any remaining
- * playlist tracks in the background so the user gets instant audio and feedback.
- *
- * @param {object} context Normalized command execution context
+ * Wait up to timeoutMs for the requesting user to upload an attachment or type "cancel" in the channel.
  */
+async function waitForUserFileMessage({ textChannel, message, userId, timeoutMs = 60000 }) {
+  if (!textChannel) {
+    return { status: 'timeout', attachment: null, followUpMessage: null };
+  }
+
+  // 1. Prefer Discord.js TextChannel.awaitMessages when available
+  if (typeof textChannel.awaitMessages === 'function') {
+    try {
+      const collected = await textChannel.awaitMessages({
+        filter: (m) => {
+          if (!m || m.author?.bot || (userId && m.author?.id !== userId)) {
+            return false;
+          }
+          const txt = String(m.content || '').trim().toLowerCase();
+          if (txt === 'cancel') {
+            return true;
+          }
+          return Boolean(extractFirstAttachment(m.attachments));
+        },
+        max: 1,
+        time: timeoutMs,
+        errors: ['time']
+      });
+
+      const firstMsg = typeof collected?.first === 'function'
+        ? collected.first()
+        : (collected instanceof Map ? collected.values().next().value : null);
+
+      if (!firstMsg) {
+        return { status: 'timeout', attachment: null, followUpMessage: null };
+      }
+
+      const txt = String(firstMsg.content || '').trim().toLowerCase();
+      if (txt === 'cancel') {
+        return { status: 'cancelled', attachment: null, followUpMessage: firstMsg };
+      }
+
+      return {
+        status: 'received',
+        attachment: extractFirstAttachment(firstMsg.attachments),
+        followUpMessage: firstMsg
+      };
+    } catch {
+      return { status: 'timeout', attachment: null, followUpMessage: null };
+    }
+  }
+
+  // 2. Fallback event listener on client or textChannel
+  const emitter = message?.client || textChannel?.client || textChannel;
+  if (!emitter || typeof emitter.on !== 'function') {
+    return { status: 'timeout', attachment: null, followUpMessage: null };
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve({ status: 'timeout', attachment: null, followUpMessage: null });
+    }, timeoutMs);
+    timer.unref?.();
+
+    const onMessage = (m) => {
+      if (!m || m.author?.bot) return;
+      if (textChannel.id && m.channelId && m.channelId !== textChannel.id) return;
+      if (userId && m.author?.id !== userId) return;
+
+      const txt = String(m.content || '').trim().toLowerCase();
+      if (txt === 'cancel') {
+        cleanup();
+        resolve({ status: 'cancelled', attachment: null, followUpMessage: m });
+        return;
+      }
+
+      const att = extractFirstAttachment(m.attachments);
+      if (att) {
+        cleanup();
+        resolve({ status: 'received', attachment: att, followUpMessage: m });
+      }
+    };
+
+    function cleanup() {
+      clearTimeout(timer);
+      emitter.off?.('messageCreate', onMessage);
+      emitter.removeListener?.('messageCreate', onMessage);
+    }
+
+    emitter.on('messageCreate', onMessage);
+  });
+}
+
+async function resolveAttachmentToTrack(resolver, attachment, requesterTag) {
+  if (typeof resolver.resolveAttachment === 'function') {
+    return resolver.resolveAttachment(attachment, { requestedBy: requesterTag });
+  }
+  const url = attachment?.url || attachment?.proxyURL;
+  return resolver.resolve(url, { requestedBy: requesterTag, lazy: true });
+}
+
 export async function execute(context) {
   const {
     guildId,
@@ -40,22 +155,15 @@ export async function execute(context) {
     textChannel,
     adapterCreator,
     requesterTag,
+    userId,
+    message,
     args,
     options,
     resolver,
     queueManager,
+    config: runtimeConfig,
     logger
   } = context;
-
-  const rawQuery = options?.getString
-    ? options.getString('query', true)
-    : (Array.isArray(args) ? args.join(' ').trim() : '');
-
-  if (!rawQuery) {
-    return {
-      embeds: [buildInvalidInputEmbed('Usage: `/play <url or search query>` or `!play <url or search query>`')]
-    };
-  }
 
   const existingSnapshot = queueManager.getSnapshot(guildId);
   if (
@@ -72,11 +180,105 @@ export async function execute(context) {
     };
   }
 
-  const resolved = await resolver.resolve(rawQuery, {
-    requestedBy: requesterTag,
-    eagerFirstTrackOnly: true,
-    lazy: true
-  });
+  // 1. Check if a file attachment was provided directly via /play file:<attachment> or attached to !play / n!play
+  const slashAttachment = options?.getAttachment ? options.getAttachment('file', false) : null;
+  const messageAttachment = extractFirstAttachment(message?.attachments);
+  const directAttachment = slashAttachment || messageAttachment;
+
+  const rawQuery = options?.getString
+    ? (options.getString('query', false) || '').trim()
+    : (Array.isArray(args) ? args.join(' ').trim() : '');
+
+  let resolved = null;
+
+  if (directAttachment) {
+    resolved = await resolveAttachmentToTrack(resolver, directAttachment, requesterTag);
+  } else if (rawQuery.toLowerCase() === 'file') {
+    // Interactive "n!play file" flow: send prompt and wait up to 60s for user to upload a file
+    const waitSeconds = runtimeConfig?.FILE_UPLOAD_TIMEOUT_SECONDS || 60;
+    const promptEmbed = buildFileUploadPromptEmbed(waitSeconds);
+
+    let promptMessage = null;
+    if (message && typeof message.reply === 'function') {
+      promptMessage = await message.reply({ embeds: [promptEmbed] });
+    } else if (textChannel && typeof textChannel.send === 'function') {
+      promptMessage = await textChannel.send({ embeds: [promptEmbed] });
+    }
+
+    const waitResult = await waitForUserFileMessage({
+      textChannel: textChannel || message?.channel,
+      message,
+      userId: userId || message?.author?.id,
+      timeoutMs: waitSeconds * 1000
+    });
+
+    if (waitResult.status === 'cancelled') {
+      const cancelEmbed = buildErrorEmbed('Upload Cancelled', 'Cancelled the audio file upload request.');
+      if (promptMessage && typeof promptMessage.edit === 'function') {
+        await promptMessage.edit({ embeds: [cancelEmbed] }).catch(() => {});
+        return { alreadyReplied: true, embeds: [cancelEmbed] };
+      }
+      return { embeds: [cancelEmbed] };
+    }
+
+    if (waitResult.status !== 'received' || !waitResult.attachment) {
+      const timeoutEmbed = buildErrorEmbed(
+        'Upload Timed Out',
+        `No audio file was uploaded within ${waitSeconds} seconds. Run **n!play file** again when you are ready.`
+      );
+      if (promptMessage && typeof promptMessage.edit === 'function') {
+        await promptMessage.edit({ embeds: [timeoutEmbed] }).catch(() => {});
+        return { alreadyReplied: true, embeds: [timeoutEmbed] };
+      }
+      return { embeds: [timeoutEmbed] };
+    }
+
+    resolved = await resolveAttachmentToTrack(resolver, waitResult.attachment, requesterTag);
+    const track = resolved.track || resolved;
+    const queueResult = await queueManager.enqueue(guildId, track, {
+      voiceChannelId,
+      textChannelId,
+      textChannel,
+      adapterCreator,
+      asyncPlayback: true
+    });
+
+    const finalPayload = queueResult.startedPlayback
+      ? {
+          embeds: [buildNowPlayingEmbed(track, queueResult.snapshot)],
+          components: [buildPlayerControlRow(queueResult.snapshot)]
+        }
+      : {
+          embeds: [buildTrackQueuedEmbed(track, queueResult.queuePosition, queueResult.snapshot)]
+        };
+
+    if (waitResult.followUpMessage && typeof waitResult.followUpMessage.reply === 'function') {
+      await waitResult.followUpMessage.reply(finalPayload).catch(() => {});
+      return { alreadyReplied: true, ...finalPayload };
+    }
+    if (promptMessage && typeof promptMessage.edit === 'function') {
+      await promptMessage.edit(finalPayload).catch(() => {});
+      return { alreadyReplied: true, ...finalPayload };
+    }
+    return finalPayload;
+  } else {
+    if (!rawQuery) {
+      return {
+        isError: true,
+        embeds: [
+          buildInvalidInputEmbed(
+            'Please provide a song title, a music URL, attach a file via **/play file:**, or type **n!play file** to upload from your device.'
+          )
+        ]
+      };
+    }
+
+    resolved = await resolver.resolve(rawQuery, {
+      requestedBy: requesterTag,
+      eagerFirstTrackOnly: true,
+      lazy: true
+    });
+  }
 
   if (resolved.kind === 'playlist') {
     const queueResult = await queueManager.enqueue(guildId, resolved.tracks, {
@@ -87,7 +289,6 @@ export async function execute(context) {
       asyncPlayback: true
     });
 
-    // If the playlist has deferred tracks to resolve in the background, start them without blocking the reply
     if (typeof resolved.backgroundTasks === 'function') {
       void resolved
         .backgroundTasks(async (resolvedTrack) => {
